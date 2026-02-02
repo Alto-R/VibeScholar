@@ -73,6 +73,10 @@ class ScienceDirectAdapter(BaseSiteAdapter):
         super().__init__(session)
         self.captcha_watchdog: CaptchaWatchdog | None = None
 
+    async def _handle_captcha_globally(self) -> bool:
+        """Handle CAPTCHA using global lock mechanism from base class."""
+        return await self.handle_captcha()
+
     def _get_captcha_watchdog(self) -> CaptchaWatchdog:
         """Get or create CaptchaWatchdog instance."""
         if self.captcha_watchdog is None:
@@ -611,3 +615,103 @@ class ScienceDirectAdapter(BaseSiteAdapter):
             pass
 
         return None
+
+    async def _extract_search_results_via_dom_service(self) -> list[dict]:
+        """
+        Extract search results using DOMService for more reliable extraction.
+
+        Returns:
+            List of dicts with title, href, authors, journal, date
+        """
+        # Use DOMService from base class
+        dom = self.dom_service
+
+        # Extract article links
+        links = await dom.extract_links(
+            selector="a[href*='/science/article/']",
+            filter_pattern=r"/science/article/"
+        )
+
+        results = []
+        seen_hrefs = set()
+
+        for link in links:
+            href = link.get("href", "")
+            title = link.get("text", "").strip()
+
+            # Skip duplicates and short titles
+            if href in seen_hrefs or not title or len(title) < 10:
+                continue
+            seen_hrefs.add(href)
+
+            results.append({
+                "title": title,
+                "href": href,
+                "authors": [],  # Will be extracted separately if needed
+                "journal": None,
+                "date": None
+            })
+
+        return results
+
+    async def _extract_paper_details_via_dom_service(self) -> dict:
+        """
+        Extract paper details using DOMService.
+
+        Returns:
+            Dict with title, abstract, authors, doi, journal, date, pdf_url
+        """
+        dom = self.dom_service
+
+        # Extract title
+        title_elements = await dom.extract_elements(
+            selectors=["h1.title-text", ".title-text", "span.title-text"],
+            include_children=False
+        )
+        title = title_elements[0].text if title_elements else "Unknown Title"
+
+        # Extract abstract
+        abstract_elements = await dom.extract_elements(
+            selectors=["#abstracts .abstract", ".abstract.author", "div[id='abs0010']"],
+            include_children=False
+        )
+        abstract = abstract_elements[0].text if abstract_elements else None
+
+        # Extract authors
+        author_elements = await dom.extract_elements(
+            selectors=[".author-group .author .content span.text", ".AuthorGroups .author"],
+            include_children=False
+        )
+        authors = [elem.text.strip() for elem in author_elements if elem.text.strip()]
+
+        # Extract DOI link
+        doi_links = await dom.extract_links(
+            selector="a.doi, a[href*='doi.org']",
+            filter_pattern=r"doi\.org"
+        )
+        doi = None
+        if doi_links:
+            doi = self._extract_doi_from_url(doi_links[0].get("href", ""))
+
+        # Extract journal
+        journal_elements = await dom.extract_elements(
+            selectors=[".publication-title-link", ".title-link"],
+            include_children=False
+        )
+        journal = journal_elements[0].text.strip() if journal_elements else None
+
+        # Extract PDF URL
+        pdf_links = await dom.extract_links(
+            selector="a.pdf-download, a[href*='/pdf/'], .PdfLink a",
+            filter_pattern=r"/pdf/|pdfft"
+        )
+        pdf_url = pdf_links[0].get("href") if pdf_links else None
+
+        return {
+            "title": title,
+            "abstract": abstract,
+            "authors": authors,
+            "doi": doi,
+            "journal": journal,
+            "pdf_url": pdf_url
+        }

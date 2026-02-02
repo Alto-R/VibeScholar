@@ -1,4 +1,10 @@
-"""Browser session management using Playwright."""
+"""Browser session management using Playwright.
+
+This module provides:
+1. BrowserSession - Core browser session with authentication persistence
+2. SessionManager - Enhanced session manager with timeout cleanup and LRU eviction
+3. Utility functions for browser detection and proxy configuration
+"""
 
 import asyncio
 import json
@@ -7,15 +13,26 @@ import os
 import socket
 import sys
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Dict, Optional
 
-from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
+from playwright.async_api import (
+    Browser,
+    BrowserContext,
+    Page,
+    Playwright,
+    async_playwright,
+)
 
 from ..config import settings
 
 logger = logging.getLogger(__name__)
 
+
+# =============================================================================
+# Constants
+# =============================================================================
 
 # Browser paths by platform
 BROWSER_PATHS = {
@@ -26,7 +43,11 @@ BROWSER_PATHS = {
             os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
         ],
         "darwin": ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"],
-        "linux": ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium-browser"],
+        "linux": [
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium-browser",
+        ],
     },
     "edge": {
         "win32": [
@@ -48,17 +69,24 @@ BROWSER_ARGS = [
 ]
 
 
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+
 def find_browser(browser_type: str = "chrome") -> str | None:
     """Find installed browser path.
 
     Args:
         browser_type: "chrome" or "edge"
+
+    Returns:
+        Path to browser executable or None if not found
     """
     platform = sys.platform
     paths = BROWSER_PATHS.get(browser_type, {}).get(platform, [])
 
     for path in paths:
-        # Expand environment variables
         expanded_path = os.path.expandvars(path)
         if os.path.exists(expanded_path):
             logger.info(f"Found {browser_type} browser: {expanded_path}")
@@ -67,13 +95,12 @@ def find_browser(browser_type: str = "chrome") -> str | None:
     return None
 
 
-def find_edge_browser() -> str | None:
-    """Find installed Edge browser path. (Legacy function for compatibility)"""
-    return find_browser("edge")
-
-
 def detect_proxy() -> str | None:
-    """Auto-detect local proxy (v2ray, clash, etc.)."""
+    """Auto-detect local proxy (v2ray, clash, etc.).
+
+    Returns:
+        Proxy URL or None if not detected
+    """
     if not settings.auto_detect_proxy:
         return settings.proxy_url
 
@@ -105,16 +132,41 @@ def detect_proxy() -> str | None:
     return None
 
 
+# =============================================================================
+# BrowserSession Class
+# =============================================================================
+
+
 class BrowserSession:
-    """Manages a Playwright browser session with authentication persistence."""
+    """Manages a Playwright browser session with authentication persistence.
+
+    Features:
+    - Automatic storage state persistence (cookies, localStorage)
+    - Proxy auto-detection
+    - Support for Chrome, Edge, and Chromium browsers
+
+    Usage:
+        session = BrowserSession(session_id="sciencedirect", headless=False)
+        await session.start()
+        # Use session.page for browser automation
+        await session.stop()
+    """
 
     def __init__(
         self,
         session_id: str = "default",
         headless: bool | None = None,
         proxy: str | None = None,
-        browser_type: str = "chrome",  # "chrome", "edge", or "chromium" (bundled)
+        browser_type: str = "chrome",
     ):
+        """Initialize browser session.
+
+        Args:
+            session_id: Unique identifier for this session (used for storage state)
+            headless: Run browser in headless mode (default from settings)
+            proxy: Proxy URL (auto-detected if not provided)
+            browser_type: "chrome", "edge", or "chromium"
+        """
         self.session_id = session_id
         self.headless = headless if headless is not None else settings.headless
         self.proxy = proxy or detect_proxy()
@@ -142,21 +194,21 @@ class BrowserSession:
 
     def _load_storage_state(self) -> str | None:
         """Load storage state, preferring session-specific, falling back to shared."""
-        # 1. Check session-specific storage state
         if self.storage_state_path.exists():
             logger.info(f"Loading session storage state: {self.storage_state_path}")
             return str(self.storage_state_path)
 
-        # 2. Try to copy from shared storage state
         if self.shared_storage_state_path.exists():
             try:
                 import shutil
+
                 shutil.copy(self.shared_storage_state_path, self.storage_state_path)
-                logger.info(f"Copied shared storage state to session: {self.storage_state_path}")
+                logger.info(
+                    f"Copied shared storage state to session: {self.storage_state_path}"
+                )
                 return str(self.storage_state_path)
             except Exception as e:
                 logger.warning(f"Failed to copy shared storage state: {e}")
-                # Fall back to using shared state directly
                 return str(self.shared_storage_state_path)
 
         logger.info("No storage state found, starting fresh session")
@@ -171,32 +223,28 @@ class BrowserSession:
 
         self._playwright = await async_playwright().start()
 
-        # Browser launch options
         launch_options = {
             "headless": self.headless,
             "args": BROWSER_ARGS,
         }
 
-        # Try to use installed browser (chrome or edge)
         if self.browser_type in ("chrome", "edge"):
             browser_path = find_browser(self.browser_type)
             if browser_path:
                 launch_options["executable_path"] = browser_path
-                logger.info(f"Using installed {self.browser_type} browser: {browser_path}")
+                logger.info(f"Using installed {self.browser_type}: {browser_path}")
             else:
-                logger.warning(f"{self.browser_type} not found, using Playwright's bundled Chromium")
+                logger.warning(
+                    f"{self.browser_type} not found, using Playwright's Chromium"
+                )
 
         if self.proxy:
             launch_options["proxy"] = {"server": self.proxy}
             logger.info(f"Using proxy: {self.proxy}")
 
-        # Launch browser using chromium (works with Edge executable)
         self._browser = await self._playwright.chromium.launch(**launch_options)
 
-        # Create context with storage state if exists
-        context_options = {
-            "viewport": {"width": 1920, "height": 1080},
-        }
+        context_options = {"viewport": {"width": 1920, "height": 1080}}
 
         storage_state = self._load_storage_state()
         if storage_state:
@@ -272,9 +320,11 @@ class BrowserSession:
         try:
             await self.page.wait_for_load_state("domcontentloaded", timeout=timeout)
         except Exception:
-            pass  # Continue even if timeout
+            pass
 
-    async def screenshot(self, path: str | None = None, full_page: bool = False) -> bytes:
+    async def screenshot(
+        self, path: str | None = None, full_page: bool = False
+    ) -> bytes:
         """Take a screenshot."""
         options = {"full_page": full_page}
         if path:
@@ -292,14 +342,25 @@ class BrowserSession:
         await self._context.add_cookies(cookies)
 
 
+# =============================================================================
+# Context Manager
+# =============================================================================
+
+
 @asynccontextmanager
 async def browser_session(
     session_id: str = "default",
     headless: bool | None = None,
     proxy: str | None = None,
-    browser_type: str = "chrome",  # "chrome", "edge", or "chromium"
+    browser_type: str = "chrome",
 ) -> AsyncIterator[BrowserSession]:
-    """Context manager for browser sessions."""
+    """Context manager for browser sessions.
+
+    Usage:
+        async with browser_session("sciencedirect", headless=False) as session:
+            await session.goto("https://www.sciencedirect.com")
+            # Do something with session.page
+    """
     session = BrowserSession(
         session_id=session_id,
         headless=headless,
@@ -313,52 +374,237 @@ async def browser_session(
         await session.stop()
 
 
-# Global session manager
-class SessionManager:
-    """Manages multiple browser sessions."""
+# =============================================================================
+# SessionManager Class
+# =============================================================================
 
-    def __init__(self):
-        self._sessions: dict[str, BrowserSession] = {}
+
+class SessionManager:
+    """Enhanced session manager with timeout cleanup and activity tracking.
+
+    Features:
+    - Per-site session management with automatic reuse
+    - Automatic cleanup of idle sessions
+    - Maximum session limit with LRU eviction
+    - Activity tracking for session reuse
+    - Storage state persistence per site
+
+    Usage:
+        manager = SessionManager(max_sessions=5, session_timeout=600)
+        session = await manager.get_session("sciencedirect", headless=False)
+        # Use session...
+        await manager.close_all()
+    """
+
+    def __init__(
+        self,
+        max_sessions: int = 5,
+        session_timeout: int = 600,
+        headless: bool = False,
+        browser_type: str = "chrome",
+        proxy: Optional[str] = None,
+    ):
+        """Initialize session manager.
+
+        Args:
+            max_sessions: Maximum number of concurrent sessions
+            session_timeout: Session idle timeout in seconds (default 10 minutes)
+            headless: Default headless mode for new sessions
+            browser_type: Default browser type ("chrome", "edge", "chromium")
+            proxy: Default proxy URL for all sessions
+        """
+        self.max_sessions = max_sessions
+        self.session_timeout = session_timeout
+        self.headless = headless
+        self.browser_type = browser_type
+        self.proxy = proxy
+
+        self._sessions: Dict[str, BrowserSession] = {}
+        self._last_activity: Dict[str, datetime] = {}
         self._lock = asyncio.Lock()
 
     async def get_session(
         self,
-        session_id: str = "default",
-        headless: bool | None = None,
-        proxy: str | None = None,
-        browser_type: str = "chrome",  # "chrome", "edge", or "chromium"
+        site: str = "default",
+        headless: Optional[bool] = None,
+        browser_type: Optional[str] = None,
+        proxy: Optional[str] = None,
     ) -> BrowserSession:
-        """Get or create a browser session."""
-        async with self._lock:
-            if session_id not in self._sessions:
-                session = BrowserSession(
-                    session_id=session_id,
-                    headless=headless,
-                    proxy=proxy,
-                    browser_type=browser_type,
-                )
-                await session.start()
-                self._sessions[session_id] = session
-            return self._sessions[session_id]
+        """Get or create a session for a site.
 
-    async def close_session(self, session_id: str) -> None:
+        Args:
+            site: Site identifier (e.g., "sciencedirect", "nature")
+            headless: Override default headless setting
+            browser_type: Override default browser type
+            proxy: Override default proxy
+
+        Returns:
+            Browser session for the site
+        """
+        async with self._lock:
+            await self._cleanup_expired()
+
+            if site in self._sessions:
+                session = self._sessions[site]
+                if session.is_connected:
+                    self._last_activity[site] = datetime.now()
+                    logger.info(f"Reusing existing session for {site}")
+                    return session
+                else:
+                    logger.info(f"Session for {site} disconnected, removing")
+                    await self._remove_session(site)
+
+            if len(self._sessions) >= self.max_sessions:
+                await self._cleanup_oldest()
+
+            session = await self._create_session(
+                site,
+                headless=headless,
+                browser_type=browser_type,
+                proxy=proxy,
+            )
+            self._sessions[site] = session
+            self._last_activity[site] = datetime.now()
+            logger.info(f"Created new session for {site}")
+            return session
+
+    async def _create_session(
+        self,
+        site: str,
+        headless: Optional[bool] = None,
+        browser_type: Optional[str] = None,
+        proxy: Optional[str] = None,
+    ) -> BrowserSession:
+        """Create a new browser session."""
+        session = BrowserSession(
+            session_id=site,  # Use site as session_id for storage persistence
+            headless=headless if headless is not None else self.headless,
+            browser_type=browser_type or self.browser_type,
+            proxy=proxy or self.proxy,
+        )
+        await session.start()
+        return session
+
+    async def _cleanup_expired(self) -> None:
+        """Remove sessions that have been idle too long."""
+        now = datetime.now()
+        expired = []
+
+        for site, last_time in self._last_activity.items():
+            idle_seconds = (now - last_time).total_seconds()
+            if idle_seconds > self.session_timeout:
+                logger.info(f"Session for {site} expired (idle {idle_seconds:.0f}s)")
+                expired.append(site)
+
+        for site in expired:
+            await self._remove_session(site)
+
+    async def _cleanup_oldest(self) -> None:
+        """Remove the oldest (least recently used) session."""
+        if not self._last_activity:
+            return
+
+        oldest_site = min(self._last_activity, key=self._last_activity.get)
+        logger.info(f"Removing oldest session: {oldest_site}")
+        await self._remove_session(oldest_site)
+
+    async def _remove_session(self, site: str) -> None:
+        """Remove and close a session."""
+        if site in self._sessions:
+            try:
+                await self._sessions[site].stop()
+            except Exception as e:
+                logger.warning(f"Error closing session for {site}: {e}")
+            del self._sessions[site]
+
+        if site in self._last_activity:
+            del self._last_activity[site]
+
+    async def close_session(self, site: str) -> None:
         """Close a specific session."""
         async with self._lock:
-            if session_id in self._sessions:
-                await self._sessions[session_id].stop()
-                del self._sessions[session_id]
+            await self._remove_session(site)
 
     async def close_all(self) -> None:
         """Close all sessions."""
         async with self._lock:
-            for session in self._sessions.values():
-                await session.stop()
-            self._sessions.clear()
+            sites = list(self._sessions.keys())
+            for site in sites:
+                await self._remove_session(site)
+            logger.info("All sessions closed")
+
+    def has_session(self, site: str) -> bool:
+        """Check if a session exists for a site."""
+        return site in self._sessions and self._sessions[site].is_connected
 
     def list_sessions(self) -> list[str]:
-        """List active session IDs."""
+        """List active session site identifiers."""
         return list(self._sessions.keys())
 
+    def get_session_info(self, site: str) -> Optional[dict]:
+        """Get information about a session."""
+        if site not in self._sessions:
+            return None
+
+        session = self._sessions[site]
+        last_activity = self._last_activity.get(site)
+        idle_seconds = (
+            (datetime.now() - last_activity).total_seconds() if last_activity else 0
+        )
+
+        return {
+            "site": site,
+            "session_id": session.session_id,
+            "is_connected": session.is_connected,
+            "headless": session.headless,
+            "browser_type": session.browser_type,
+            "last_activity": last_activity.isoformat() if last_activity else None,
+            "idle_seconds": idle_seconds,
+        }
+
+    async def refresh_session(self, site: str) -> BrowserSession:
+        """Refresh a session by closing and recreating it."""
+        async with self._lock:
+            old_session = self._sessions.get(site)
+            headless = old_session.headless if old_session else self.headless
+            browser_type = old_session.browser_type if old_session else self.browser_type
+            proxy = old_session.proxy if old_session else self.proxy
+
+            await self._remove_session(site)
+
+            session = await self._create_session(
+                site,
+                headless=headless,
+                browser_type=browser_type,
+                proxy=proxy,
+            )
+            self._sessions[site] = session
+            self._last_activity[site] = datetime.now()
+            logger.info(f"Refreshed session for {site}")
+            return session
+
+    async def __aenter__(self) -> "SessionManager":
+        """Async context manager entry."""
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Async context manager exit - close all sessions."""
+        await self.close_all()
+
+
+# =============================================================================
+# Global Instance
+# =============================================================================
 
 # Global session manager instance
-session_manager = SessionManager()
+session_manager = SessionManager(
+    max_sessions=5,
+    session_timeout=600,  # 10 minutes
+    headless=False,  # Default to visible mode for CAPTCHA handling
+    browser_type="chrome",
+)
+
+
+async def cleanup_session_manager() -> None:
+    """Clean up the global session manager."""
+    await session_manager.close_all()

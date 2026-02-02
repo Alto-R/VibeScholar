@@ -1,4 +1,9 @@
-"""Search and download papers on a given topic from Nature."""
+"""Search and download papers on a given topic from Nature.
+
+Also tests the new browser modules integration with NatureAdapter:
+- CaptchaHandler: Global CAPTCHA handling with lock mechanism
+- DOMService: DOM extraction service
+"""
 
 import asyncio
 from pathlib import Path
@@ -8,6 +13,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from vibescholar.browser import session_manager
+from vibescholar.browser.captcha_handler import CaptchaHandler
+from vibescholar.browser.dom_service import DOMService
 from vibescholar.sites import NatureAdapter
 from vibescholar.config import settings
 
@@ -76,8 +83,78 @@ async def test_nature(session):
     return downloaded, failed
 
 
+# ============================================================================
+# 新模块集成测试
+# ============================================================================
+
+async def test_adapter_modules(session):
+    """Test NatureAdapter integration with new modules."""
+    print("\n" + "=" * 70)
+    print("测试 NatureAdapter 模块集成")
+    print("=" * 70)
+
+    adapter = NatureAdapter(session)
+
+    # Test captcha_handler property
+    print("\n1. 测试 captcha_handler 属性...")
+    handler = adapter.captcha_handler
+    print(f"   CaptchaHandler: {type(handler).__name__}")
+    assert isinstance(handler, CaptchaHandler), "captcha_handler should be CaptchaHandler"
+    print("   ✓ 成功")
+
+    # Test dom_service property
+    print("\n2. 测试 dom_service 属性...")
+    dom = adapter.dom_service
+    print(f"   DOMService: {type(dom).__name__}")
+    assert isinstance(dom, DOMService), "dom_service should be DOMService"
+    print("   ✓ 成功")
+
+    # Test is_captcha_page method
+    print("\n3. 测试 is_captcha_page 方法...")
+    test_cases = [
+        ("Are you a robot?", True),
+        ("验证码", True),
+        ("Nature Research", False),
+    ]
+    for content, expected in test_cases:
+        result = adapter.is_captcha_page(content)
+        status = "✓" if result == expected else "✗"
+        print(f"   {status} '{content}' -> {result}")
+
+    # Test DOMService on Nature homepage
+    print("\n4. 测试 DOMService 在 Nature 首页...")
+    await session.goto("https://www.nature.com")
+    await asyncio.sleep(2)
+
+    # Refresh dom_service for new page
+    dom = adapter.dom_service
+    links = await dom.extract_links(selector="a[href]")
+    print(f"   找到 {len(links)} 个链接")
+
+    text = await dom.extract_text_content("h1, h2", join_separator=" | ")
+    print(f"   标题: {text[:80]}..." if text else "   未找到标题")
+
+    print("\nNatureAdapter 模块集成测试完成!")
+    return True
+
+
 async def main():
     """Main test function."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Nature 测试")
+    parser.add_argument(
+        "--modules",
+        action="store_true",
+        help="运行新模块集成测试"
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="运行所有测试 (模块测试 + 下载测试)"
+    )
+    args = parser.parse_args()
+
     print("=" * 70)
     print("PDF 下载功能测试 (Nature)")
     print(f"搜索主题: {SEARCH_TOPIC}")
@@ -90,7 +167,13 @@ async def main():
 
     # 创建浏览器会话（可见模式，方便用户观察）
     print("\n创建浏览器会话...")
-    session = await session_manager.get_session(headless=False)
+    session = await session_manager.get_session(headless=False if not args.modules else True)
+
+    # Run module tests if requested
+    if args.modules or args.all:
+        await test_adapter_modules(session)
+        if not args.all:
+            return
 
     downloaded, failed = await test_nature(session)
 

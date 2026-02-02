@@ -3,10 +3,12 @@
 import asyncio
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 from urllib.parse import urljoin
 
 from ..browser.watchdogs import AuthWatchdog, CookieWatchdog
+from ..browser.captcha_handler import CaptchaHandler
+from ..browser.dom_service import DOMService
 from ..papers.models import DownloadResult, Paper, PaperSource, SearchResult
 
 if TYPE_CHECKING:
@@ -63,6 +65,42 @@ class BaseSiteAdapter(ABC):
         self._last_request_time: float = 0
         self.auth_watchdog = AuthWatchdog(session.session_id)
         self.cookie_watchdog: CookieWatchdog | None = None
+        self._captcha_handler: CaptchaHandler | None = None
+        self._dom_service: DOMService | None = None
+
+    @property
+    def captcha_handler(self) -> CaptchaHandler:
+        """Get or create CaptchaHandler for this adapter."""
+        if self._captcha_handler is None:
+            self._captcha_handler = CaptchaHandler(self.session)
+        return self._captcha_handler
+
+    @property
+    def dom_service(self) -> DOMService:
+        """Get or create DOMService for current page."""
+        if self._dom_service is None or self._dom_service.page != self.session.page:
+            self._dom_service = DOMService(self.session.page)
+        return self._dom_service
+
+    async def handle_captcha(self, url: Optional[str] = None) -> bool:
+        """
+        Handle CAPTCHA using global lock mechanism.
+
+        Opens a visible browser window for user to solve CAPTCHA.
+        Other requests will wait for this to complete.
+
+        Args:
+            url: URL to navigate to for CAPTCHA solving (defaults to current page)
+
+        Returns:
+            True if CAPTCHA was solved successfully
+        """
+        captcha_url = url or self.session.page.url
+        return await self.captcha_handler.handle_captcha(captcha_url)
+
+    def is_captcha_page(self, content: str) -> bool:
+        """Check if page content indicates a CAPTCHA challenge."""
+        return self.captcha_handler._is_captcha_page(content)
 
     @abstractmethod
     async def search(
