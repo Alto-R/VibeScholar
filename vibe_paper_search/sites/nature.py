@@ -68,20 +68,45 @@ class NatureAdapter(BaseSiteAdapter):
         try:
             await self._navigate(search_url)
 
-            # Wait for search results
+            # Wait for search results - look for article links
             await self.session.page.wait_for_selector(
-                'article[data-track-action="view article"]',
+                'a[data-track-action="view article"]',
                 timeout=15000,
             )
 
-            # Extract search results
-            articles = await self.session.page.query_selector_all(
-                'article[data-track-action="view article"]'
-            )
+            # Extract search results using JavaScript for better reliability
+            results_data = await self.session.page.evaluate('''() => {
+                const results = [];
+                document.querySelectorAll('a[data-track-action="view article"]').forEach(link => {
+                    const card = link.closest('article') || link.closest('.c-card') || link.parentElement;
+                    if (!card) return;
 
-            for article in articles[:max_results]:
+                    // Get title
+                    const title = link.innerText.trim();
+                    const href = link.href;
+
+                    // Get authors
+                    const authorElems = card.querySelectorAll('.c-author-list__item, [itemprop="author"], .c-card__author-list span');
+                    const authors = Array.from(authorElems).map(a => a.innerText.trim().replace(/,\\s*$/, '')).filter(a => a && a !== '...');
+
+                    // Get journal
+                    const journalElem = card.querySelector('.c-meta__item, [data-test="journal-title"], .c-card__journal');
+                    const journal = journalElem ? journalElem.innerText.trim() : null;
+
+                    // Get date
+                    const timeElem = card.querySelector('time[datetime]');
+                    const date = timeElem ? timeElem.getAttribute('datetime') : null;
+
+                    if (title && href) {
+                        results.push({ title, href, authors, journal, date });
+                    }
+                });
+                return results;
+            }''')
+
+            for data in results_data[:max_results]:
                 try:
-                    paper = await self._parse_search_result(article)
+                    paper = self._parse_search_data(data)
                     if paper:
                         papers.append(paper)
                 except Exception as e:
@@ -103,6 +128,48 @@ class NatureAdapter(BaseSiteAdapter):
             source=self.source,
             has_more=len(papers) >= max_results,
         )
+
+    def _parse_search_data(self, data: dict) -> Paper | None:
+        """Parse search result data from JavaScript extraction."""
+        try:
+            title = data.get("title", "").strip()
+            href = data.get("href", "")
+            if not title or not href:
+                return None
+
+            url = urljoin(self.base_url, href)
+
+            # Parse authors
+            authors = [Author(name=name) for name in data.get("authors", []) if name]
+
+            # Parse journal
+            journal = data.get("journal")
+
+            # Parse date
+            published_date = None
+            date_str = data.get("date")
+            if date_str:
+                try:
+                    published_date = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                except ValueError:
+                    pass
+
+            # Extract DOI from URL
+            doi = self._extract_doi_from_url(url)
+
+            return Paper(
+                title=title,
+                authors=authors,
+                url=url,
+                doi=doi,
+                journal=journal.strip() if journal else None,
+                published_date=published_date,
+                source=self.source,
+            )
+
+        except Exception as e:
+            logger.warning(f"Error parsing search data: {e}")
+            return None
 
     async def _parse_search_result(self, article) -> Paper | None:
         """Parse a search result article element."""
