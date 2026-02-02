@@ -28,9 +28,9 @@ class Settings(BaseSettings):
     )
 
     # Browser settings
-    browser_type: Literal["chromium", "firefox", "webkit"] = Field(
-        default="chromium",
-        description="Browser type to use for automation",
+    browser: Literal["chrome", "edge", "chromium"] = Field(
+        default="chrome",
+        description="Browser to use: 'chrome' (installed Chrome), 'edge' (installed Edge), or 'chromium' (bundled)",
     )
     headless: bool = Field(
         default=True,

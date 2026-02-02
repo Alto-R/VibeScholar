@@ -3,7 +3,9 @@
 import asyncio
 import json
 import logging
+import os
 import socket
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
@@ -13,6 +15,61 @@ from playwright.async_api import Browser, BrowserContext, Page, Playwright, asyn
 from ..config import settings
 
 logger = logging.getLogger(__name__)
+
+
+# Browser paths by platform
+BROWSER_PATHS = {
+    "chrome": {
+        "win32": [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+        ],
+        "darwin": ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"],
+        "linux": ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium-browser"],
+    },
+    "edge": {
+        "win32": [
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        ],
+        "darwin": ["/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"],
+        "linux": ["/usr/bin/microsoft-edge", "/usr/bin/microsoft-edge-stable"],
+    },
+}
+
+# Anti-automation detection args
+BROWSER_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--disable-infobars",
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+]
+
+
+def find_browser(browser_type: str = "chrome") -> str | None:
+    """Find installed browser path.
+
+    Args:
+        browser_type: "chrome" or "edge"
+    """
+    platform = sys.platform
+    paths = BROWSER_PATHS.get(browser_type, {}).get(platform, [])
+
+    for path in paths:
+        # Expand environment variables
+        expanded_path = os.path.expandvars(path)
+        if os.path.exists(expanded_path):
+            logger.info(f"Found {browser_type} browser: {expanded_path}")
+            return expanded_path
+
+    return None
+
+
+def find_edge_browser() -> str | None:
+    """Find installed Edge browser path. (Legacy function for compatibility)"""
+    return find_browser("edge")
 
 
 def detect_proxy() -> str | None:
@@ -56,10 +113,12 @@ class BrowserSession:
         session_id: str = "default",
         headless: bool | None = None,
         proxy: str | None = None,
+        browser_type: str = "chrome",  # "chrome", "edge", or "chromium" (bundled)
     ):
         self.session_id = session_id
         self.headless = headless if headless is not None else settings.headless
         self.proxy = proxy or detect_proxy()
+        self.browser_type = browser_type
 
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
@@ -72,9 +131,36 @@ class BrowserSession:
         return settings.storage_state_dir / f"{self.session_id}_storage.json"
 
     @property
+    def shared_storage_state_path(self) -> Path:
+        """Path to shared storage state file."""
+        return settings.storage_state_dir / "shared_storage.json"
+
+    @property
     def is_connected(self) -> bool:
         """Check if browser is connected."""
         return self._browser is not None and self._browser.is_connected()
+
+    def _load_storage_state(self) -> str | None:
+        """Load storage state, preferring session-specific, falling back to shared."""
+        # 1. Check session-specific storage state
+        if self.storage_state_path.exists():
+            logger.info(f"Loading session storage state: {self.storage_state_path}")
+            return str(self.storage_state_path)
+
+        # 2. Try to copy from shared storage state
+        if self.shared_storage_state_path.exists():
+            try:
+                import shutil
+                shutil.copy(self.shared_storage_state_path, self.storage_state_path)
+                logger.info(f"Copied shared storage state to session: {self.storage_state_path}")
+                return str(self.storage_state_path)
+            except Exception as e:
+                logger.warning(f"Failed to copy shared storage state: {e}")
+                # Fall back to using shared state directly
+                return str(self.shared_storage_state_path)
+
+        logger.info("No storage state found, starting fresh session")
+        return None
 
     async def start(self) -> None:
         """Start the browser session."""
@@ -88,31 +174,33 @@ class BrowserSession:
         # Browser launch options
         launch_options = {
             "headless": self.headless,
+            "args": BROWSER_ARGS,
         }
+
+        # Try to use installed browser (chrome or edge)
+        if self.browser_type in ("chrome", "edge"):
+            browser_path = find_browser(self.browser_type)
+            if browser_path:
+                launch_options["executable_path"] = browser_path
+                logger.info(f"Using installed {self.browser_type} browser: {browser_path}")
+            else:
+                logger.warning(f"{self.browser_type} not found, using Playwright's bundled Chromium")
 
         if self.proxy:
             launch_options["proxy"] = {"server": self.proxy}
+            logger.info(f"Using proxy: {self.proxy}")
 
-        # Launch browser
-        browser_type = getattr(self._playwright, settings.browser_type)
-        self._browser = await browser_type.launch(**launch_options)
+        # Launch browser using chromium (works with Edge executable)
+        self._browser = await self._playwright.chromium.launch(**launch_options)
 
         # Create context with storage state if exists
         context_options = {
             "viewport": {"width": 1920, "height": 1080},
-            "user_agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
         }
 
-        if self.storage_state_path.exists():
-            try:
-                context_options["storage_state"] = str(self.storage_state_path)
-                logger.info(f"Loaded storage state from {self.storage_state_path}")
-            except Exception as e:
-                logger.warning(f"Failed to load storage state: {e}")
+        storage_state = self._load_storage_state()
+        if storage_state:
+            context_options["storage_state"] = storage_state
 
         self._context = await self._browser.new_context(**context_options)
         self._page = await self._context.new_page()
@@ -209,9 +297,15 @@ async def browser_session(
     session_id: str = "default",
     headless: bool | None = None,
     proxy: str | None = None,
+    browser_type: str = "chrome",  # "chrome", "edge", or "chromium"
 ) -> AsyncIterator[BrowserSession]:
     """Context manager for browser sessions."""
-    session = BrowserSession(session_id=session_id, headless=headless, proxy=proxy)
+    session = BrowserSession(
+        session_id=session_id,
+        headless=headless,
+        proxy=proxy,
+        browser_type=browser_type,
+    )
     try:
         await session.start()
         yield session
@@ -232,6 +326,7 @@ class SessionManager:
         session_id: str = "default",
         headless: bool | None = None,
         proxy: str | None = None,
+        browser_type: str = "chrome",  # "chrome", "edge", or "chromium"
     ) -> BrowserSession:
         """Get or create a browser session."""
         async with self._lock:
@@ -240,6 +335,7 @@ class SessionManager:
                     session_id=session_id,
                     headless=headless,
                     proxy=proxy,
+                    browser_type=browser_type,
                 )
                 await session.start()
                 self._sessions[session_id] = session
