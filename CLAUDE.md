@@ -4,15 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**vibe-paper-search** 是一个 MCP Server，用于 AI 驱动的学术论文搜索、下载和分类。使用 Playwright 进行浏览器自动化，支持访问 Nature、ScienceDirect 等需要机构认证的学术网站。
+**vibescholar** 是一个 MCP Server，用于 AI 驱动的学术论文搜索、下载和分类。使用 Playwright 进行浏览器自动化，支持访问 Nature、ScienceDirect 等需要机构认证的学术网站。
 
 ### 核心功能
 
 - 跨多个学术数据库搜索论文 (Nature, ScienceDirect)
 - 自动处理机构认证和登录状态持久化
 - 下载 PDF 并自动命名
-- 处理 CAPTCHA 和 Cookie 同意弹窗
-- 支持 Chrome/Edge 浏览器切换
+- 处理 CAPTCHA 和 Cookie 同意弹窗 (支持后台监控)
+- 支持 Chrome/Edge 浏览器切换 (默认 Edge)
 
 ## Python 环境
 
@@ -32,18 +32,18 @@ playwright install chromium  # 浏览器自动化必需
 
 # 开发
 pytest                       # 运行测试
-mypy vibe_paper_search       # 类型检查
-ruff check vibe_paper_search # 代码检查
-ruff check --fix vibe_paper_search # 自动修复
+mypy vibescholar             # 类型检查
+ruff check vibescholar       # 代码检查
+ruff check --fix vibescholar # 自动修复
 
 # 运行 MCP 服务器
-d:/anaconda/envs/vibepaper/python.exe -m vibe_paper_search.mcp.server
+d:/anaconda/envs/vibepaper/python.exe -m vibescholar.mcp.server
 ```
 
 ## 目录结构
 
 ```text
-vibe_paper_search/
+vibescholar/
 ├── __init__.py
 ├── config.py                    # 配置管理 (pydantic-settings)
 │
@@ -54,9 +54,13 @@ vibe_paper_search/
 ├── browser/                     # 浏览器自动化层
 │   ├── __init__.py
 │   ├── session.py              # 浏览器会话管理 (Playwright)
+│   ├── captcha_handler.py      # CAPTCHA 处理 (全局锁机制)
+│   ├── dom_service.py          # DOM 操作服务
 │   └── watchdogs/
 │       ├── __init__.py
-│       └── auth_watchdog.py    # 认证状态和付费墙检测
+│       ├── auth_watchdog.py    # 认证状态和付费墙检测
+│       ├── captcha_watchdog.py # CAPTCHA 页面状态检测
+│       └── cookie_watchdog.py  # Cookie 同意弹窗监控
 │
 ├── sites/                       # 学术网站适配器
 │   ├── __init__.py
@@ -73,6 +77,11 @@ vibe_paper_search/
 │
 └── utils/                       # 工具函数
     └── __init__.py
+
+tests/
+├── test_download_nature.py     # Nature 下载测试
+├── test_download_sciencedirect.py # ScienceDirect 下载测试
+└── run_download.py             # 下载测试运行脚本
 ```
 
 ## 核心模块详解
@@ -84,12 +93,13 @@ vibe_paper_search/
 ```python
 class Settings(BaseSettings):
     # 存储路径
-    data_dir: Path              # 默认 ~/.vibe-paper-search
-    papers_dir: Path            # PDF 存储目录
+    data_dir: Path              # 默认 ~/.vibescholar
+    papers_dir: Path            # PDF 存储目录 (默认 data_dir/papers)
 
     # 浏览器设置
-    browser: Literal["chrome", "edge", "chromium"]  # 默认 "chrome"
-    headless: bool              # 默认 True
+    browser: Literal["chrome", "edge"]  # 默认 "edge"
+    headless: bool              # 默认 False (显示浏览器窗口)
+    user_data_dir: Path | None  # Chrome 用户数据目录
 
     # 代理设置
     proxy_url: str | None       # HTTP 代理
@@ -99,17 +109,27 @@ class Settings(BaseSettings):
     openai_api_key: str | None
     anthropic_api_key: str | None
     llm_provider: Literal["openai", "anthropic"]
+    llm_model: str              # 默认 "gpt-4o-mini"
+
+    # MCP Server 设置
+    mcp_host: str               # 默认 "localhost"
+    mcp_port: int               # 默认 8765
+
+    # 搜索设置
+    default_max_results: int    # 默认 20
+    search_timeout: int         # 默认 60 秒
+    download_timeout: int       # 默认 120 秒
 ```
 
 关键属性:
 
-- `storage_state_dir`: `~/.vibe-paper-search/auth/` - 认证状态存储
-- `database_path`: `~/.vibe-paper-search/papers.db` - SQLite 数据库
-- `logs_dir`: `~/.vibe-paper-search/logs/` - 日志目录
+- `storage_state_dir`: `~/.vibescholar/auth/` - 认证状态存储
+- `database_path`: `~/.vibescholar/papers.db` - SQLite 数据库
+- `logs_dir`: `~/.vibescholar/logs/` - 日志目录
 
 ### 2. 浏览器会话 (`browser/session.py`)
 
-Playwright 封装，支持 Chrome/Edge/Chromium。
+Playwright 封装，支持 Chrome/Edge。
 
 ```python
 # 浏览器路径配置
@@ -138,8 +158,15 @@ BROWSER_ARGS = [
 关键类:
 
 - `BrowserSession`: 单个浏览器会话，管理页面和存储状态
-- `SessionManager`: 全局会话管理器，支持多会话
+- `SessionManager`: 增强型会话管理器，支持超时清理和 LRU 淘汰
 - `browser_session()`: 异步上下文管理器
+
+**SessionManager 特性:**
+
+- 每站点会话管理，自动复用
+- 空闲会话自动清理 (默认 10 分钟超时)
+- 最大会话数限制 (默认 5 个)，LRU 淘汰
+- 活动追踪和会话刷新
 
 关键功能:
 
@@ -147,7 +174,28 @@ BROWSER_ARGS = [
 - `detect_proxy()`: 自动检测本地代理 (v2ray/clash 端口)
 - 存储状态持久化: `{session_id}_storage.json`
 
-### 3. 网站适配器 (`sites/`)
+### 3. 浏览器辅助模块
+
+#### CaptchaHandler (`browser/captcha_handler.py`)
+
+- 全局锁机制处理 CAPTCHA
+- 打开可见浏览器窗口让用户解决
+- 其他请求等待 CAPTCHA 解决完成
+
+#### DOMService (`browser/dom_service.py`)
+
+- DOM 操作封装
+- 元素查找和交互
+
+#### Watchdogs (`browser/watchdogs/`)
+
+| 模块 | 功能 |
+| ---- | ---- |
+| `AuthWatchdog` | 认证状态检测、付费墙检测、PDF 可用性检测 |
+| `CaptchaWatchdog` | CAPTCHA 页面状态检测 (PageState 枚举) |
+| `CookieWatchdog` | Cookie 同意弹窗后台监控和自动处理 |
+
+### 4. 网站适配器 (`sites/`)
 
 #### 基类 (`base.py`)
 
@@ -159,6 +207,12 @@ class BaseSiteAdapter(ABC):
     requires_auth: bool         # 是否需要认证
     requests_per_minute: int    # 速率限制
 
+    # 内置服务
+    auth_watchdog: AuthWatchdog
+    cookie_watchdog: CookieWatchdog
+    captcha_handler: CaptchaHandler
+    dom_service: DOMService
+
     @abstractmethod
     async def search(query, max_results, **kwargs) -> SearchResult
 
@@ -168,8 +222,11 @@ class BaseSiteAdapter(ABC):
     @abstractmethod
     async def download_pdf(paper, save_path) -> DownloadResult
 
-    @abstractmethod
     async def check_access(url) -> bool
+    async def handle_captcha(url) -> bool
+    async def wait_for_user_auth(timeout, check_interval) -> bool
+    async def find_pdf_link(extra_selectors) -> tuple[str | None, any]
+    async def download_pdf_via_js(pdf_url, save_path) -> DownloadResult
 ```
 
 #### Nature 适配器 (`nature.py`)
@@ -196,13 +253,7 @@ class PageState(str, Enum):
     UNKNOWN = "unknown"
 ```
 
-关键方法:
-
-- `_detect_page_state()`: 检测当前页面状态
-- `_wait_for_ready_state()`: 等待 CAPTCHA 解决
-- `_handle_cookie_consent()`: 处理 Cookie 弹窗
-
-### 4. 数据模型 (`papers/models.py`)
+### 5. 数据模型 (`papers/models.py`)
 
 ```python
 class PaperSource(str, Enum):
@@ -213,6 +264,7 @@ class PaperSource(str, Enum):
     IEEE = "ieee"
     SPRINGER = "springer"
     GOOGLE_SCHOLAR = "google_scholar"
+    UNKNOWN = "unknown"
 
 class Author(BaseModel):
     name: str
@@ -232,7 +284,11 @@ class Paper(BaseModel):
     authors: list[Author]
     abstract: str | None
     journal: str | None
+    publisher: str | None
     published_date: datetime | None
+    volume: str | None
+    issue: str | None
+    pages: str | None
 
     # 来源信息
     source: PaperSource
@@ -248,6 +304,13 @@ class Paper(BaseModel):
     pdf_path: str | None
     downloaded_at: datetime | None
 
+    # 时间戳
+    created_at: datetime
+    updated_at: datetime
+
+    # 扩展元数据
+    extra: dict[str, Any]
+
     # 计算属性
     @computed_field
     def author_names(self) -> list[str]
@@ -262,6 +325,8 @@ class SearchQuery(BaseModel):
     date_from: datetime | None
     date_to: datetime | None
     max_results: int
+    sort_by: str | None
+    filters: dict[str, Any]
 
 class SearchResult(BaseModel):
     papers: list[Paper]
@@ -270,6 +335,7 @@ class SearchResult(BaseModel):
     search_time: float
     source: PaperSource
     has_more: bool
+    next_page_token: str | None
 
 class DownloadResult(BaseModel):
     paper_id: str
@@ -277,9 +343,15 @@ class DownloadResult(BaseModel):
     pdf_path: str | None
     error: str | None
     file_size: int | None
+
+class CategoryResult(BaseModel):
+    paper_id: str
+    categories: list[str]
+    confidence: float
+    reasoning: str | None
 ```
 
-### 5. MCP Server (`mcp/server.py`)
+### 6. MCP Server (`mcp/server.py`)
 
 提供 6 个工具:
 
@@ -291,12 +363,6 @@ class DownloadResult(BaseModel):
 | `check_access` | 检查访问权限 (url) |
 | `login` | 打开浏览器进行手动登录 (site) |
 | `list_downloaded` | 列出已下载论文 (category) |
-
-### 6. 认证管理 (`browser/watchdogs/auth_watchdog.py`)
-
-- 检测登录页面和付费墙
-- 管理每个站点的认证状态文件
-- 存储路径: `~/.vibe-paper-search/auth/{session}_{site}_auth.json`
 
 ## 关键模式
 
@@ -346,14 +412,14 @@ await page.wait_for_url(lambda url: "/search" in url)
 ```python
 # 测试 ScienceDirect 搜索
 import asyncio
-from vibe_paper_search.browser.session import BrowserSession
-from vibe_paper_search.sites.sciencedirect import ScienceDirectAdapter
+from vibescholar.browser.session import BrowserSession
+from vibescholar.sites.sciencedirect import ScienceDirectAdapter
 
 async def test():
     session = BrowserSession(
         session_id='sciencedirect',
         headless=False,
-        browser_type='chrome',  # 或 'edge'
+        browser_type='edge',  # 或 'chrome'
     )
     await session.start()
 
@@ -372,17 +438,19 @@ asyncio.run(test())
 
 ### CAPTCHA 处理
 
-ScienceDirect 会触发 CAPTCHA，适配器会等待用户手动解决 (headless=False 时)
+ScienceDirect 会触发 CAPTCHA，适配器会等待用户手动解决 (headless=False 时)。使用 `CaptchaHandler` 的全局锁机制确保同一时间只有一个 CAPTCHA 处理窗口。
 
 ### Cookie 弹窗
 
-`_handle_cookie_consent()` 自动处理，并保存存储状态
+`CookieWatchdog` 支持两种模式:
+
+- `handle_once()`: 一次性处理
+- `start()/stop()`: 后台持续监控
 
 ### 浏览器选择
 
 - `chrome`: 使用已安装的 Chrome
-- `edge`: 使用已安装的 Edge
-- `chromium`: 使用 Playwright 内置的 Chromium
+- `edge`: 使用已安装的 Edge (默认)
 
 ### 代理检测
 
@@ -392,3 +460,4 @@ ScienceDirect 会触发 CAPTCHA，适配器会等待用户手动解决 (headless
 - 10809 (v2ray HTTP)
 - 7891 (Clash SOCKS5)
 - 10808 (v2ray SOCKS5)
+- 1080 (通用 SOCKS5)

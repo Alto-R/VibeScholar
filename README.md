@@ -1,4 +1,4 @@
-# Vibe Paper Search
+# Vibe Scholar
 
 AI-powered academic paper search, download, and categorization tool.
 
@@ -8,12 +8,14 @@ AI-powered academic paper search, download, and categorization tool.
 - **Institutional Authentication**: Supports Shibboleth, EZProxy, and other institutional login methods
 - **PDF Download**: Download papers with proper authentication
 - **MCP Integration**: Use with Claude, Cursor, and other MCP-compatible AI tools
+- **CAPTCHA Handling**: Automatic detection with user-assisted solving
+- **Cookie Consent**: Automatic handling of cookie consent dialogs
 
 ## Installation
 
 ```bash
 # Clone the repository
-cd vibe-paper-search
+cd vibescholar
 
 # Install with pip
 pip install -e .
@@ -28,15 +30,15 @@ Create a `.env` file or set environment variables:
 
 ```bash
 # Storage paths
-VIBE_DATA_DIR=~/.vibe-paper-search
+VIBE_DATA_DIR=~/.vibescholar
 VIBE_PAPERS_DIR=~/Papers
 
 # Browser settings
-VIBE_HEADLESS=true
-VIBE_BROWSER_TYPE=chromium
+VIBE_HEADLESS=false
+VIBE_BROWSER=edge
 
 # Proxy (auto-detected if not set)
-VIBE_PROXY_URL=http://127.0.0.1:7897
+VIBE_PROXY_URL=http://127.0.0.1:7890
 
 # AI settings (optional)
 VIBE_OPENAI_API_KEY=sk-...
@@ -52,9 +54,9 @@ Add to your Claude/Cursor MCP configuration:
 ```json
 {
   "mcpServers": {
-    "vibe-paper-search": {
+    "vibescholar": {
       "command": "python",
-      "args": ["-m", "vibe_paper_search.mcp.server"]
+      "args": ["-m", "vibescholar.mcp.server"]
     }
   }
 }
@@ -63,30 +65,35 @@ Add to your Claude/Cursor MCP configuration:
 ### Available MCP Tools
 
 1. **search_papers** - Search for academic papers
-   ```
+
+   ```yaml
    query: "machine learning protein structure"
    sources: ["nature", "sciencedirect"]
    max_results: 10
    ```
 
 2. **get_paper_details** - Get detailed paper information
-   ```
+
+   ```yaml
    url: "https://www.nature.com/articles/..."
    ```
 
 3. **download_paper** - Download PDF (requires authentication)
-   ```
+
+   ```yaml
    url: "https://www.nature.com/articles/..."
    filename: "optional_custom_name.pdf"
    ```
 
 4. **check_access** - Check if you have access to a paper
-   ```
+
+   ```yaml
    url: "https://www.nature.com/articles/..."
    ```
 
 5. **login** - Open browser for institutional login
-   ```
+
+   ```yaml
    site: "nature" | "sciencedirect"
    ```
 
@@ -103,14 +110,16 @@ For accessing paywalled content:
 
 ## Project Structure
 
-```
-vibe_paper_search/
+```text
+vibescholar/
 ├── config.py           # Configuration management
 ├── mcp/                # MCP Server
 │   └── server.py       # MCP tools implementation
 ├── browser/            # Browser automation
 │   ├── session.py      # Playwright session management
-│   └── watchdogs/      # Auth and download handlers
+│   ├── captcha_handler.py  # CAPTCHA handling
+│   ├── dom_service.py  # DOM operations
+│   └── watchdogs/      # Auth, CAPTCHA, and cookie handlers
 ├── sites/              # Academic site adapters
 │   ├── base.py         # Base adapter interface
 │   ├── nature.py       # Nature.com adapter
@@ -130,10 +139,10 @@ pip install -e ".[dev]"
 pytest
 
 # Type checking
-mypy vibe_paper_search
+mypy vibescholar
 
 # Linting
-ruff check vibe_paper_search
+ruff check vibescholar
 ```
 
 ## License
