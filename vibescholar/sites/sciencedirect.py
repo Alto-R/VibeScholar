@@ -4,27 +4,16 @@ import asyncio
 import logging
 import re
 from datetime import datetime
-from enum import Enum
 from urllib.parse import quote_plus, urljoin
 
 from playwright.async_api import TimeoutError as PlaywrightTimeout
 
 from ..browser.session import BrowserSession
-from ..browser.watchdogs import AuthWatchdog
+from ..browser.watchdogs import AuthWatchdog, CaptchaWatchdog, CookieWatchdog, PageState
 from ..papers.models import Author, DownloadResult, Paper, PaperSource, SearchQuery, SearchResult
 from .base import BaseSiteAdapter
 
 logger = logging.getLogger(__name__)
-
-
-class PageState(str, Enum):
-    """Detected page state for ScienceDirect."""
-    CAPTCHA = "captcha"
-    SEARCH_RESULTS = "search_results"
-    NO_RESULTS = "no_results"
-    ARTICLE_PAGE = "article_page"
-    LOGIN_REQUIRED = "login_required"
-    UNKNOWN = "unknown"
 
 
 class ScienceDirectAdapter(BaseSiteAdapter):
@@ -43,25 +32,28 @@ class ScienceDirectAdapter(BaseSiteAdapter):
     min_request_interval = 1.0
 
     # Page detection selectors
+    # ScienceDirect specific CAPTCHA page selectors
     CAPTCHA_SELECTORS = [
-        "iframe[src*='captcha']",
-        "iframe[src*='challenge']",
-        "#px-captcha",
-        ".challenge-form",
-        "[data-testid='challenge']",
-        "div[class*='captcha']",
+        # Cloudflare Turnstile CAPTCHA
+        "iframe[src*='challenges.cloudflare.com']",
+        "iframe[src*='turnstile']",
+        "iframe[title*='Cloudflare']",
+        # ScienceDirect CAPTCHA page structure
+        ".error-card",  # Error card container
+        "#captcha-box",  # CAPTCHA container
+        "h1:has-text('Are you a robot')",  # "Are you a robot?" heading
         # PerimeterX bot detection
+        "#px-captcha",
         "#px-captcha-wrapper",
-        "div[id*='px']",
     ]
 
-    # Bot detection / waiting page indicators
-    BOT_DETECTION_INDICATORS = [
-        "请稍后",  # Chinese "please wait"
-        "Please wait",
-        "Checking your browser",
-        "Just a moment",
-        "Verifying",
+    # ScienceDirect specific CAPTCHA page text indicators
+    # These are checked in page content
+    CAPTCHA_TEXT_INDICATORS = [
+        "Are you a robot",
+        "Please confirm you are a human",
+        "completing the captcha challenge",
+        "Reference number:",  # This appears on the CAPTCHA page
     ]
 
     SEARCH_RESULT_SELECTORS = [
@@ -77,152 +69,46 @@ class ScienceDirectAdapter(BaseSiteAdapter):
         "text='No results found'",
     ]
 
-    # Cookie consent button selectors
-    COOKIE_CONSENT_SELECTORS = [
-        "button#onetrust-accept-btn-handler",  # OneTrust (common)
-        "button[data-testid='accept-cookies']",
-        "button.accept-cookies",
-        "button[aria-label*='Accept']",
-        "button[aria-label*='accept']",
-        "#accept-cookies",
-        ".cookie-accept",
-        "button:has-text('Accept')",
-        "button:has-text('Accept all')",
-        "button:has-text('I agree')",
-    ]
-
     def __init__(self, session: BrowserSession):
         super().__init__(session)
         self.auth_watchdog = AuthWatchdog(session.session_id)
+        self.cookie_watchdog: CookieWatchdog | None = None
+        self.captcha_watchdog: CaptchaWatchdog | None = None
+
+    def _get_captcha_watchdog(self) -> CaptchaWatchdog:
+        """Get or create CaptchaWatchdog instance."""
+        if self.captcha_watchdog is None:
+            self.captcha_watchdog = CaptchaWatchdog(
+                page=self.session.page,
+                captcha_selectors=self.CAPTCHA_SELECTORS,
+                text_indicators=self.CAPTCHA_TEXT_INDICATORS,
+                search_result_selectors=self.SEARCH_RESULT_SELECTORS,
+                no_results_selectors=self.NO_RESULTS_SELECTORS,
+                article_selectors=["h1.title-text", ".article-header", "#article"],
+            )
+        return self.captcha_watchdog
+
+    async def _start_cookie_monitor(self) -> None:
+        """Start background cookie consent monitor using CookieWatchdog."""
+        if self.cookie_watchdog is None:
+            self.cookie_watchdog = CookieWatchdog(self.session.page)
+        await self.cookie_watchdog.start()
+
+    async def _stop_cookie_monitor(self) -> None:
+        """Stop background cookie consent monitor."""
+        if self.cookie_watchdog:
+            await self.cookie_watchdog.stop()
 
     async def _handle_cookie_consent(self) -> bool:
-        """Try to accept cookie consent popup if present. Keeps trying until no more popups."""
-        page = self.session.page
-        accepted_any = False
+        """Handle cookie consent popup once using CookieWatchdog."""
+        if self.cookie_watchdog is None:
+            self.cookie_watchdog = CookieWatchdog(self.session.page)
+        return await self.cookie_watchdog.handle_once()
 
-        # Keep trying until no more cookie popups are found
-        max_attempts = 5
-        for attempt in range(max_attempts):
-            found_popup = False
-
-            for selector in self.COOKIE_CONSENT_SELECTORS:
-                try:
-                    button = await page.query_selector(selector)
-                    if button and await button.is_visible():
-                        logger.info(f"Found cookie consent button: {selector}")
-                        await button.click()
-                        await asyncio.sleep(1)  # Wait for popup to close
-                        accepted_any = True
-                        found_popup = True
-                        break  # Check again from the beginning
-                except Exception:
-                    pass
-
-            if not found_popup:
-                break  # No more popups found
-
-        if accepted_any:
-            # Save storage state after accepting cookies
-            await self.session.save_storage_state()
-            logger.info("Saved storage state after accepting cookies")
-
-        return accepted_any
-
-    async def _detect_page_state(self) -> PageState:
-        """Detect the current page state."""
-        page = self.session.page
-
-        # Check page title for bot detection indicators
-        try:
-            title = await page.title()
-            for indicator in self.BOT_DETECTION_INDICATORS:
-                if indicator.lower() in title.lower():
-                    logger.info(f"Bot detection page detected: {title}")
-                    return PageState.CAPTCHA
-        except Exception:
-            pass
-
-        # Check for CAPTCHA elements
-        for selector in self.CAPTCHA_SELECTORS:
-            try:
-                elem = await page.query_selector(selector)
-                if elem:
-                    logger.info(f"CAPTCHA element detected: {selector}")
-                    return PageState.CAPTCHA
-            except Exception:
-                pass
-
-        # Check page content for bot detection text
-        try:
-            body_text = await page.evaluate("() => document.body.innerText.substring(0, 500)")
-            for indicator in self.BOT_DETECTION_INDICATORS:
-                if indicator.lower() in body_text.lower():
-                    logger.info(f"Bot detection text found: {indicator}")
-                    return PageState.CAPTCHA
-        except Exception:
-            pass
-
-        # Check for search results
-        for selector in self.SEARCH_RESULT_SELECTORS:
-            try:
-                elems = await page.query_selector_all(selector)
-                if elems and len(elems) > 0:
-                    logger.info(f"Search results detected: {len(elems)} items")
-                    return PageState.SEARCH_RESULTS
-            except Exception:
-                pass
-
-        # Check for no results
-        for selector in self.NO_RESULTS_SELECTORS:
-            try:
-                elem = await page.query_selector(selector)
-                if elem:
-                    return PageState.NO_RESULTS
-            except Exception:
-                pass
-
-        # Check for article page
-        article_selectors = ["h1.title-text", ".article-header", "#article"]
-        for selector in article_selectors:
-            try:
-                elem = await page.query_selector(selector)
-                if elem:
-                    return PageState.ARTICLE_PAGE
-            except Exception:
-                pass
-
-        return PageState.UNKNOWN
-
-    async def _wait_for_ready_state(self, timeout: int = 120000, check_interval: float = 2.0) -> PageState:
-        """
-        Wait for page to be in a ready state (not CAPTCHA).
-
-        Args:
-            timeout: Maximum wait time in milliseconds
-            check_interval: Time between checks in seconds
-
-        Returns:
-            The detected page state when ready
-        """
-        start_time = asyncio.get_event_loop().time()
-        timeout_seconds = timeout / 1000
-
-        while True:
-            state = await self._detect_page_state()
-
-            if state == PageState.CAPTCHA:
-                elapsed = asyncio.get_event_loop().time() - start_time
-                if elapsed > timeout_seconds:
-                    logger.warning("Timeout waiting for CAPTCHA to be solved")
-                    return state
-                logger.info(f"Waiting for CAPTCHA to be solved... ({elapsed:.0f}s)")
-                await asyncio.sleep(check_interval)
-                continue
-
-            # Any other state means we can proceed
-            return state
-
-        return PageState.UNKNOWN
+    async def _wait_for_ready_state(self, timeout: int = 120000) -> PageState:
+        """Wait for page to be in a ready state using CaptchaWatchdog."""
+        watchdog = self._get_captcha_watchdog()
+        return await watchdog.wait_for_ready_state(timeout=timeout)
 
     async def search(
         self,
@@ -250,15 +136,19 @@ class ScienceDirectAdapter(BaseSiteAdapter):
         start_time = time.time()
         papers = []
 
+        # Start cookie monitor in background
+        await self._start_cookie_monitor()
+
         try:
             # Step 1: Navigate to homepage (like a human would)
             logger.info("Navigating to ScienceDirect homepage...")
             await self._navigate(self.base_url)
 
-            # Wait for page to be ready
+            # Wait for page to be ready (handles CAPTCHA with user notification)
             page_state = await self._wait_for_ready_state(timeout=120000)
             if page_state == PageState.CAPTCHA:
-                logger.warning("CAPTCHA on homepage - waiting for user")
+                logger.warning("CAPTCHA not solved on homepage - returning empty result")
+                return self._empty_result(query, max_results, time.time() - start_time)
 
             # Step 1.5: Handle cookie consent popup if present
             if await self._handle_cookie_consent():
@@ -368,6 +258,9 @@ class ScienceDirectAdapter(BaseSiteAdapter):
             logger.warning(f"Timeout during search: {e}")
         except Exception as e:
             logger.error(f"Search failed: {e}")
+        finally:
+            # Stop cookie monitor
+            await self._stop_cookie_monitor()
 
         search_time = time.time() - start_time
 
@@ -552,7 +445,15 @@ class ScienceDirectAdapter(BaseSiteAdapter):
         )
 
     async def download_pdf(self, paper: Paper, save_path: str) -> DownloadResult:
-        """Download PDF for a paper."""
+        """
+        Download PDF for a paper.
+
+        Flow:
+        1. Navigate to paper page, handle CAPTCHA if appears
+        2. Find and click PDF link
+        3. Handle second CAPTCHA if appears
+        4. Download from web PDF viewer page
+        """
         if not paper.pdf_url and not paper.url:
             return DownloadResult(
                 paper_id=paper.id,
@@ -560,44 +461,134 @@ class ScienceDirectAdapter(BaseSiteAdapter):
                 error="No PDF URL available",
             )
 
-        try:
-            # Navigate to paper page if needed
-            if not paper.pdf_url:
-                await self._navigate(paper.url)
-                # Try to find PDF link
-                pdf_elem = await self.session.page.query_selector(
-                    "a.pdf-download, a[href*='/pdf/'], .PdfLink a"
-                )
-                if pdf_elem:
-                    pdf_href = await pdf_elem.get_attribute("href")
-                    paper.pdf_url = urljoin(self.base_url, pdf_href) if pdf_href else None
+        # Start cookie monitor in background
+        await self._start_cookie_monitor()
 
-            if not paper.pdf_url:
+        try:
+            # Step 1: Navigate to paper page
+            logger.info(f"Navigating to paper page: {paper.url}")
+            await self._navigate(paper.url)
+
+            # Wait for page to be ready (handles first CAPTCHA)
+            logger.info("Waiting for article page to load (first CAPTCHA check)...")
+            page_state = await self._wait_for_ready_state(timeout=120000)
+            if page_state == PageState.CAPTCHA:
+                return DownloadResult(
+                    paper_id=paper.id,
+                    success=False,
+                    error="CAPTCHA not solved - user did not complete verification",
+                )
+
+            # Step 2: Handle cookie consent popup before clicking PDF link
+            await self._handle_cookie_consent()
+
+            # Find PDF link
+            pdf_elem = await self.session.page.query_selector(
+                "a.pdf-download, a[href*='/pdf/'], .PdfLink a, a[title*='PDF']"
+            )
+            if not pdf_elem:
+                # Try alternative selectors
+                pdf_elem = await self.session.page.query_selector(
+                    "a:has-text('View PDF'), a:has-text('Download PDF'), button:has-text('PDF')"
+                )
+
+            if not pdf_elem:
                 return DownloadResult(
                     paper_id=paper.id,
                     success=False,
                     error="Could not find PDF download link",
                 )
 
-            # Check for paywall
-            if await self.auth_watchdog.detect_paywall(self.session.page):
+            # Get PDF URL for logging
+            pdf_href = await pdf_elem.get_attribute("href")
+            if pdf_href:
+                paper.pdf_url = urljoin(self.base_url, pdf_href)
+                logger.info(f"Found PDF link: {paper.pdf_url}")
+
+            # Step 3: Click PDF link (with retry and force click if needed)
+            print("\n正在点击 View PDF 链接...")
+            await self.session.page.bring_to_front()
+
+            try:
+                await pdf_elem.click(timeout=10000)
+            except Exception as click_error:
+                logger.warning(f"Normal click failed: {click_error}, trying force click...")
+                # Try force click using JavaScript
+                await self.session.page.evaluate('(el) => el.click()', pdf_elem)
+
+            await asyncio.sleep(2)  # Wait for navigation
+
+            # Wait for second CAPTCHA if it appears
+            logger.info("Checking for second CAPTCHA on PDF page...")
+            page_state = await self._wait_for_ready_state(timeout=120000)
+            if page_state == PageState.CAPTCHA:
                 return DownloadResult(
                     paper_id=paper.id,
                     success=False,
-                    error="Paywall detected - institutional login may be required",
+                    error="CAPTCHA not solved on PDF page - user did not complete verification",
                 )
 
-            # Download PDF
-            async with self.session.page.expect_download() as download_info:
-                await self.session.page.goto(paper.pdf_url)
+            # Step 4: Now we should be on the web PDF viewer page
+            logger.info("Attempting to download PDF from viewer page...")
+            print("进入 PDF 查看器页面，正在尝试下载...")
 
-            download = await download_info.value
-            await download.save_as(save_path)
+            # Try to download the PDF
+            current_url = self.session.page.url
+
+            if ".pdf" in current_url.lower() and "reader" not in current_url.lower():
+                # Direct PDF URL - download it
+                logger.info("Direct PDF URL detected, downloading...")
+                async with self.session.page.expect_download() as download_info:
+                    await self.session.page.reload()
+                download = await download_info.value
+                await download.save_as(save_path)
+            else:
+                # Web PDF viewer - try to find download button
+                # First try Chrome PDF viewer download button (#save)
+                download_btn = await self.session.page.query_selector(
+                    "#save, "  # Chrome PDF viewer download button
+                    "cr-icon-button#save, "  # Chrome PDF viewer
+                    "#download, "  # Alternative download button
+                    "button[aria-label='下载'], "  # Chinese download button
+                    "button[aria-label='Download'], "  # English download button
+                    "a[href*='.pdf']:not([href*='reader']), "
+                    "button:has-text('Download'), "
+                    "a:has-text('Download PDF'), "
+                    "a.download-link"
+                )
+
+                if download_btn:
+                    logger.info("Found download button in viewer, clicking...")
+                    print("找到下载按钮，正在点击...")
+                    async with self.session.page.expect_download() as download_info:
+                        try:
+                            await download_btn.click(timeout=5000)
+                        except Exception:
+                            # Try JavaScript click for shadow DOM elements
+                            await self.session.page.evaluate('(el) => el.click()', download_btn)
+                    download = await download_info.value
+                    await download.save_as(save_path)
+                else:
+                    # Try to extract PDF URL from viewer
+                    pdf_url = await self._extract_pdf_url_from_viewer()
+                    if pdf_url:
+                        logger.info(f"Extracted PDF URL from viewer: {pdf_url}")
+                        async with self.session.page.expect_download() as download_info:
+                            await self.session.page.goto(pdf_url)
+                        download = await download_info.value
+                        await download.save_as(save_path)
+                    else:
+                        return DownloadResult(
+                            paper_id=paper.id,
+                            success=False,
+                            error="Could not find PDF download option in viewer",
+                        )
 
             # Get file size
             from pathlib import Path
 
             file_size = Path(save_path).stat().st_size
+            print(f"PDF 下载成功! 文件大小: {file_size / 1024:.1f} KB")
 
             return DownloadResult(
                 paper_id=paper.id,
@@ -613,6 +604,54 @@ class ScienceDirectAdapter(BaseSiteAdapter):
                 success=False,
                 error=str(e),
             )
+        finally:
+            # Stop cookie monitor
+            await self._stop_cookie_monitor()
+
+    async def _extract_pdf_url_from_viewer(self) -> str | None:
+        """Extract PDF URL from web PDF viewer page."""
+        page = self.session.page
+
+        # Try to find PDF URL in various places
+        # 1. Check for iframe with PDF
+        iframe = await page.query_selector("iframe[src*='.pdf'], iframe[src*='pdf']")
+        if iframe:
+            src = await iframe.get_attribute("src")
+            if src:
+                return urljoin(self.base_url, src)
+
+        # 2. Check for embed or object element
+        embed = await page.query_selector("embed[src*='.pdf'], object[data*='.pdf']")
+        if embed:
+            src = await embed.get_attribute("src") or await embed.get_attribute("data")
+            if src:
+                return urljoin(self.base_url, src)
+
+        # 3. Try to extract from JavaScript or page source
+        try:
+            pdf_url = await page.evaluate('''() => {
+                // Check for common PDF viewer variables
+                if (window.defined && window.defined.pdfUrl) return window.defined.pdfUrl;
+                if (window.defined && window.defined.pdfSrc) return window.defined.pdfSrc;
+
+                // Check for links in the page
+                const links = document.querySelectorAll('a[href*=".pdf"]');
+                for (let link of links) {
+                    if (!link.href.includes('reader')) return link.href;
+                }
+
+                // Check meta tags
+                const meta = document.querySelector('meta[name="citation_pdf_url"]');
+                if (meta) return meta.content;
+
+                return null;
+            }''')
+            if pdf_url:
+                return pdf_url
+        except Exception:
+            pass
+
+        return None
 
     async def check_access(self, url: str) -> bool:
         """Check if we have access to the full text."""

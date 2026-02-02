@@ -1,5 +1,6 @@
 """Nature.com adapter for searching and downloading papers."""
 
+import asyncio
 import logging
 import re
 from datetime import datetime
@@ -8,7 +9,7 @@ from urllib.parse import quote_plus, urljoin
 from playwright.async_api import TimeoutError as PlaywrightTimeout
 
 from ..browser.session import BrowserSession
-from ..browser.watchdogs import AuthWatchdog
+from ..browser.watchdogs import AuthWatchdog, CookieWatchdog
 from ..papers.models import Author, DownloadResult, Paper, PaperSource, SearchQuery, SearchResult
 from .base import BaseSiteAdapter
 
@@ -29,6 +30,24 @@ class NatureAdapter(BaseSiteAdapter):
     def __init__(self, session: BrowserSession):
         super().__init__(session)
         self.auth_watchdog = AuthWatchdog(session.session_id)
+        self.cookie_watchdog: CookieWatchdog | None = None
+
+    async def _start_cookie_monitor(self) -> None:
+        """Start background cookie consent monitor using CookieWatchdog."""
+        if self.cookie_watchdog is None:
+            self.cookie_watchdog = CookieWatchdog(self.session.page)
+        await self.cookie_watchdog.start()
+
+    async def _stop_cookie_monitor(self) -> None:
+        """Stop background cookie consent monitor."""
+        if self.cookie_watchdog:
+            await self.cookie_watchdog.stop()
+
+    async def _handle_cookie_consent(self) -> bool:
+        """Handle cookie consent popup once using CookieWatchdog."""
+        if self.cookie_watchdog is None:
+            self.cookie_watchdog = CookieWatchdog(self.session.page)
+        return await self.cookie_watchdog.handle_once()
 
     async def search(
         self,
@@ -307,6 +326,9 @@ class NatureAdapter(BaseSiteAdapter):
                 error="No PDF URL available",
             )
 
+        # Start cookie monitor in background
+        await self._start_cookie_monitor()
+
         try:
             # Navigate to paper page if needed
             if not paper.pdf_url:
@@ -326,13 +348,26 @@ class NatureAdapter(BaseSiteAdapter):
                     error="Could not find PDF download link",
                 )
 
-            # Check for paywall
+            # Check for paywall - Nature-specific handling
             if await self.auth_watchdog.detect_paywall(self.session.page):
-                return DownloadResult(
-                    paper_id=paper.id,
-                    success=False,
-                    error="Paywall detected - institutional login may be required",
+                logger.info("Paywall detected, initiating institutional access flow...")
+
+                # Handle Nature paywall with institutional access
+                auth_result = await self._handle_nature_paywall(timeout=300)
+                if not auth_result:
+                    return DownloadResult(
+                        paper_id=paper.id,
+                        success=False,
+                        error="Authentication timeout - user did not complete login",
+                    )
+
+                # Re-check for PDF URL after authentication
+                pdf_elem = await self.session.page.query_selector(
+                    'a[data-article-pdf="true"], a[data-track-action="download pdf"], a[href*="/pdf/"]'
                 )
+                if pdf_elem:
+                    pdf_href = await pdf_elem.get_attribute("href")
+                    paper.pdf_url = urljoin(self.base_url, pdf_href) if pdf_href else paper.pdf_url
 
             # Download PDF
             async with self.session.page.expect_download() as download_info:
@@ -360,6 +395,93 @@ class NatureAdapter(BaseSiteAdapter):
                 success=False,
                 error=str(e),
             )
+        finally:
+            # Stop cookie monitor
+            await self._stop_cookie_monitor()
+
+    async def _handle_nature_paywall(self, timeout: int = 300) -> bool:
+        """
+        Handle Nature-specific paywall with institutional access.
+
+        Flow:
+        1. Find and click "Access through your institution" link
+        2. Bring browser to foreground for user to complete login
+        3. Wait for PDF download button to appear
+        4. Click the download button
+
+        Returns:
+            True if authentication successful and PDF available, False on timeout
+        """
+        page = self.session.page
+
+        # Step 1: Find and click "Access through your institution" link
+        institution_link = await page.query_selector(
+            'a:has-text("Access through your institution"), '
+            'button:has-text("Access through your institution"), '
+            '[data-track-action="institution access"]'
+        )
+
+        if institution_link:
+            logger.info("Found 'Access through your institution' link, clicking...")
+            print("\n" + "=" * 60)
+            print("检测到付费墙，正在点击机构访问链接...")
+            print("=" * 60)
+
+            # Bring browser to front before clicking
+            await page.bring_to_front()
+            await institution_link.click()
+            await asyncio.sleep(1)  # Wait for navigation/popup
+
+        # Step 2: Bring browser to foreground and wait for user to complete login
+        await page.bring_to_front()
+        print("\n" + "=" * 60)
+        print("请在浏览器窗口中完成机构登录")
+        print(f"等待时间: {timeout} 秒")
+        print("登录完成后，系统将自动检测并下载 PDF")
+        print("=" * 60 + "\n")
+
+        # Step 3: Wait for PDF download button to appear
+        pdf_download_selector = (
+            'a[data-article-pdf="true"], '
+            'a.c-pdf-download__link[data-test="download-pdf"], '
+            'a[data-track-action="download pdf"]'
+        )
+
+        elapsed = 0
+        check_interval = 2
+
+        while elapsed < timeout:
+            # Check if PDF download button is available
+            pdf_button = await page.query_selector(pdf_download_selector)
+
+            if pdf_button:
+                # Verify the button is visible and clickable
+                is_visible = await pdf_button.is_visible()
+                if is_visible:
+                    logger.info("PDF download button detected, clicking...")
+                    print("\n检测到 PDF 下载按钮，正在点击...")
+
+                    # Step 4: Click the download button
+                    pdf_href = await pdf_button.get_attribute("href")
+                    if pdf_href:
+                        # Update the page URL to the PDF URL for download
+                        logger.info(f"PDF URL found: {pdf_href}")
+                        return True
+
+            # Also check if we navigated to a PDF page directly
+            if ".pdf" in page.url.lower():
+                print("\n检测到 PDF 页面，继续下载...")
+                return True
+
+            await asyncio.sleep(check_interval)
+            elapsed += check_interval
+
+            # Print progress every 10 seconds
+            if elapsed % 10 == 0:
+                print(f"等待用户完成机构登录... ({elapsed}/{timeout}秒)")
+
+        print("\n等待超时，用户未完成认证")
+        return False
 
     async def check_access(self, url: str) -> bool:
         """Check if we have access to the full text."""

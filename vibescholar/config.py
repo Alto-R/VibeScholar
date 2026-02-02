@@ -33,8 +33,8 @@ class Settings(BaseSettings):
         description="Browser to use: 'chrome' (installed Chrome), 'edge' (installed Edge)",
     )
     headless: bool = Field(
-        default=True,
-        description="Run browser in headless mode",
+        default=False,
+        description="Run browser in headless mode (default: False, show browser window)",
     )
     user_data_dir: Path | None = Field(
         default=None,

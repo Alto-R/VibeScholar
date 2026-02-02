@@ -193,8 +193,8 @@ async def handle_search(arguments: dict) -> list[TextContent]:
     if not sources:
         sources = ["nature", "sciencedirect"]
 
-    # Get browser session
-    session = await session_manager.get_session(headless=True)
+    # Get browser session (uses config default: visible browser)
+    session = await session_manager.get_session()
 
     all_results = []
     errors = []
@@ -247,7 +247,7 @@ async def handle_get_details(arguments: dict) -> list[TextContent]:
     else:
         source = detect_source(url)
 
-    session = await session_manager.get_session(headless=True)
+    session = await session_manager.get_session()
     adapter = await get_adapter(source, session)
     paper = await adapter.get_paper_details(url)
 
@@ -276,7 +276,7 @@ async def handle_download(arguments: dict) -> list[TextContent]:
     filename = arguments.get("filename")
 
     source = detect_source(url)
-    session = await session_manager.get_session(headless=True)
+    session = await session_manager.get_session()
     adapter = await get_adapter(source, session)
 
     # Get paper details first
@@ -310,7 +310,7 @@ async def handle_check_access(arguments: dict) -> list[TextContent]:
     url = arguments["url"]
 
     source = detect_source(url)
-    session = await session_manager.get_session(headless=True)
+    session = await session_manager.get_session()
     adapter = await get_adapter(source, session)
 
     has_access = await adapter.check_access(url)
@@ -329,7 +329,7 @@ async def handle_login(arguments: dict) -> list[TextContent]:
     site = arguments["site"]
 
     # Get session with visible browser
-    session = await session_manager.get_session(headless=False)
+    session = await session_manager.get_session()
 
     if site == "nature":
         url = "https://www.nature.com"

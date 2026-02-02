@@ -48,16 +48,11 @@ LOGIN_INDICATORS = [
     r"subscription.*required",
 ]
 
-# Paywall indicators
+# Paywall indicators - patterns verified on actual paywall pages
 PAYWALL_INDICATORS = [
-    r"buy.*article",
-    r"purchase.*access",
-    r"rent.*article",
-    r"subscribe.*now",
-    r"get.*access",
-    r"full.*text.*unavailable",
-    r"pdf.*unavailable",
-    r"access.*options",
+    r"access\s+through\s+your\s+institution",  # Nature paywall indicator
+    r"buy\s+this\s+article",  # Nature paywall
+    r"access\s+options",  # Nature paywall heading
 ]
 
 
