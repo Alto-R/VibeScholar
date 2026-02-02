@@ -19,7 +19,7 @@ class Settings(BaseSettings):
 
     # Storage paths
     data_dir: Path = Field(
-        default=Path.home() / ".vibe-paper-search",
+        default=Path.home() / ".vibescholar",
         description="Base directory for all data storage",
     )
     papers_dir: Path | None = Field(
@@ -28,9 +28,9 @@ class Settings(BaseSettings):
     )
 
     # Browser settings
-    browser: Literal["chrome", "edge", "chromium"] = Field(
+    browser: Literal["chrome", "edge"] = Field(
         default="chrome",
-        description="Browser to use: 'chrome' (installed Chrome), 'edge' (installed Edge), or 'chromium' (bundled)",
+        description="Browser to use: 'chrome' (installed Chrome), 'edge' (installed Edge)",
     )
     headless: bool = Field(
         default=True,
