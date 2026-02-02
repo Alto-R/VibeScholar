@@ -51,6 +51,7 @@ LOGIN_INDICATORS = [
 # Paywall indicators - patterns verified on actual paywall pages
 PAYWALL_INDICATORS = [
     r"access\s+through\s+your\s+institution",  # Nature paywall indicator
+    r"access\s+through\s+your\s+organization",  # ScienceDirect paywall indicator
     r"buy\s+this\s+article",  # Nature paywall
     r"access\s+options",  # Nature paywall heading
 ]

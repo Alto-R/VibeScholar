@@ -482,41 +482,59 @@ class ScienceDirectAdapter(BaseSiteAdapter):
             # Step 2: Handle cookie consent popup before clicking PDF link
             await self._handle_cookie_consent()
 
-            # Find PDF link
-            pdf_elem = await self.session.page.query_selector(
-                "a.pdf-download, a[href*='/pdf/'], .PdfLink a, a[title*='PDF']"
-            )
-            if not pdf_elem:
-                # Try alternative selectors
-                pdf_elem = await self.session.page.query_selector(
-                    "a:has-text('View PDF'), a:has-text('Download PDF'), button:has-text('PDF')"
-                )
+            # Step 2.5: Check for paywall and handle authentication if needed
+            if await self.auth_watchdog.detect_paywall(self.session.page):
+                logger.info("Paywall detected, initiating institutional access flow...")
 
-            if not pdf_elem:
+                # Click institution access link if available
+                institution_link = await self.session.page.query_selector(
+                    'a:has-text("Access through your institution"), '
+                    'a:has-text("Access through your organization")'
+                )
+                if institution_link:
+                    await self.session.page.bring_to_front()
+                    await institution_link.click()
+                    await asyncio.sleep(1)
+
+                # Use base class method to wait for user authentication
+                if not await self.wait_for_user_auth(timeout=300):
+                    return DownloadResult(
+                        paper_id=paper.id,
+                        success=False,
+                        error="Authentication timeout - user did not complete login",
+                    )
+
+            # Find PDF link using base class method
+            logger.info("Looking for PDF download link...")
+            sd_selectors = [
+                "a[href*='pdfft']",
+            ]
+            pdf_url, pdf_elem = await self.find_pdf_link(extra_selectors=sd_selectors)
+
+            if not pdf_url:
+                # No PDF link found - likely no access
                 return DownloadResult(
                     paper_id=paper.id,
                     success=False,
-                    error="Could not find PDF download link",
+                    error="No access to this paper - requires purchase or institutional login",
                 )
 
-            # Get PDF URL for logging
-            pdf_href = await pdf_elem.get_attribute("href")
-            if pdf_href:
-                paper.pdf_url = urljoin(self.base_url, pdf_href)
-                logger.info(f"Found PDF link: {paper.pdf_url}")
+            # Update paper.pdf_url
+            paper.pdf_url = pdf_url
+            logger.info(f"Found PDF link: {paper.pdf_url}")
 
-            # Step 3: Click PDF link (with retry and force click if needed)
-            print("\n正在点击 View PDF 链接...")
-            await self.session.page.bring_to_front()
+            # Step 3: Click PDF link to navigate to viewer (with retry and force click if needed)
+            if pdf_elem:
+                print("\n正在点击 View PDF 链接...")
+                await self.session.page.bring_to_front()
 
-            try:
-                await pdf_elem.click(timeout=10000)
-            except Exception as click_error:
-                logger.warning(f"Normal click failed: {click_error}, trying force click...")
-                # Try force click using JavaScript
-                await self.session.page.evaluate('(el) => el.click()', pdf_elem)
+                try:
+                    await pdf_elem.click(timeout=10000)
+                except Exception as click_error:
+                    logger.warning(f"Normal click failed: {click_error}, trying force click...")
+                    await self.session.page.evaluate('(el) => el.click()', pdf_elem)
 
-            await asyncio.sleep(2)  # Wait for navigation
+                await asyncio.sleep(2)  # Wait for navigation
 
             # Wait for second CAPTCHA if it appears
             logger.info("Checking for second CAPTCHA on PDF page...")
@@ -532,70 +550,30 @@ class ScienceDirectAdapter(BaseSiteAdapter):
             logger.info("Attempting to download PDF from viewer page...")
             print("进入 PDF 查看器页面，正在尝试下载...")
 
-            # Try to download the PDF
+            # Try to extract PDF URL from viewer page
             current_url = self.session.page.url
+            print(f"DEBUG: Current URL in viewer: {current_url}")
 
-            if ".pdf" in current_url.lower() and "reader" not in current_url.lower():
-                # Direct PDF URL - download it
-                logger.info("Direct PDF URL detected, downloading...")
-                async with self.session.page.expect_download() as download_info:
-                    await self.session.page.reload()
-                download = await download_info.value
-                await download.save_as(save_path)
-            else:
-                # Web PDF viewer - try to find download button
-                # First try Chrome PDF viewer download button (#save)
-                download_btn = await self.session.page.query_selector(
-                    "#save, "  # Chrome PDF viewer download button
-                    "cr-icon-button#save, "  # Chrome PDF viewer
-                    "#download, "  # Alternative download button
-                    "button[aria-label='下载'], "  # Chinese download button
-                    "button[aria-label='Download'], "  # English download button
-                    "a[href*='.pdf']:not([href*='reader']), "
-                    "button:has-text('Download'), "
-                    "a:has-text('Download PDF'), "
-                    "a.download-link"
+            final_pdf_url = await self._extract_pdf_url_from_viewer()
+
+            if not final_pdf_url:
+                # If no PDF URL found, check if current URL is a direct PDF URL
+                if ".pdf" in current_url.lower() and "reader" not in current_url.lower():
+                    final_pdf_url = current_url
+                elif "/pdf/" in current_url or "pdfft" in current_url:
+                    final_pdf_url = current_url.replace("/reader/", "/")
+
+            if not final_pdf_url:
+                return DownloadResult(
+                    paper_id=paper.id,
+                    success=False,
+                    error="Could not find PDF URL to download",
                 )
 
-                if download_btn:
-                    logger.info("Found download button in viewer, clicking...")
-                    print("找到下载按钮，正在点击...")
-                    async with self.session.page.expect_download() as download_info:
-                        try:
-                            await download_btn.click(timeout=5000)
-                        except Exception:
-                            # Try JavaScript click for shadow DOM elements
-                            await self.session.page.evaluate('(el) => el.click()', download_btn)
-                    download = await download_info.value
-                    await download.save_as(save_path)
-                else:
-                    # Try to extract PDF URL from viewer
-                    pdf_url = await self._extract_pdf_url_from_viewer()
-                    if pdf_url:
-                        logger.info(f"Extracted PDF URL from viewer: {pdf_url}")
-                        async with self.session.page.expect_download() as download_info:
-                            await self.session.page.goto(pdf_url)
-                        download = await download_info.value
-                        await download.save_as(save_path)
-                    else:
-                        return DownloadResult(
-                            paper_id=paper.id,
-                            success=False,
-                            error="Could not find PDF download option in viewer",
-                        )
-
-            # Get file size
-            from pathlib import Path
-
-            file_size = Path(save_path).stat().st_size
-            print(f"PDF 下载成功! 文件大小: {file_size / 1024:.1f} KB")
-
-            return DownloadResult(
-                paper_id=paper.id,
-                success=True,
-                pdf_path=save_path,
-                file_size=file_size,
-            )
+            # Download using base class method
+            result = await self.download_pdf_via_js(final_pdf_url, save_path)
+            result.paper_id = paper.id
+            return result
 
         except Exception as e:
             logger.error(f"PDF download failed: {e}")

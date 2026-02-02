@@ -10,6 +10,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeout
 
 from ..browser.session import BrowserSession
 from ..browser.watchdogs import AuthWatchdog, CookieWatchdog
+from ..config import settings
 from ..papers.models import Author, DownloadResult, Paper, PaperSource, SearchQuery, SearchResult
 from .base import BaseSiteAdapter
 
@@ -369,24 +370,47 @@ class NatureAdapter(BaseSiteAdapter):
                     pdf_href = await pdf_elem.get_attribute("href")
                     paper.pdf_url = urljoin(self.base_url, pdf_href) if pdf_href else paper.pdf_url
 
-            # Download PDF
-            async with self.session.page.expect_download() as download_info:
-                await self.session.page.goto(paper.pdf_url)
+            # Download PDF - must click the download link, not navigate to PDF URL
+            # Navigating directly to PDF URL opens the browser's PDF viewer instead of triggering download
+            await self._navigate(paper.url)
 
-            download = await download_info.value
-            await download.save_as(save_path)
+            # Handle cookie consent popup first (may block download button)
+            await self._handle_cookie_consent()
 
-            # Get file size
-            from pathlib import Path
+            # Wait for page to be fully loaded
+            await asyncio.sleep(1)
 
-            file_size = Path(save_path).stat().st_size
+            # Debug: print current URL
+            logger.info(f"Current URL: {self.session.page.url}")
+            print(f"DEBUG: Current URL: {self.session.page.url}")
 
-            return DownloadResult(
-                paper_id=paper.id,
-                success=True,
-                pdf_path=save_path,
-                file_size=file_size,
-            )
+            # Find the download PDF link using base class method
+            nature_selectors = [
+                'a[data-track-action="download pdf"]',
+                'a.c-pdf-download__link',
+                'a[href*="_reference.pdf"]',
+            ]
+            pdf_url, pdf_download_link = await self.find_pdf_link(extra_selectors=nature_selectors)
+
+            if not pdf_url:
+                # Take screenshot for debugging
+                screenshot_path = str(settings.data_dir / "debug_no_download_button.png")
+                await self.session.page.screenshot(path=screenshot_path)
+                print(f"DEBUG: Screenshot saved to {screenshot_path}")
+
+                return DownloadResult(
+                    paper_id=paper.id,
+                    success=False,
+                    error="Could not find PDF download button on page",
+                )
+
+            logger.info(f"Full PDF URL: {pdf_url}")
+            print(f"DEBUG: Full PDF URL: {pdf_url}")
+
+            # Download using base class method
+            result = await self.download_pdf_via_js(pdf_url, save_path)
+            result.paper_id = paper.id
+            return result
 
         except Exception as e:
             logger.error(f"PDF download failed: {e}")

@@ -4,6 +4,7 @@ import asyncio
 import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
+from urllib.parse import urljoin
 
 from ..papers.models import DownloadResult, Paper, PaperSource, SearchResult
 
@@ -17,6 +18,25 @@ logger = logging.getLogger(__name__)
 # Only click "Accept all cookies" button to avoid triggering cookie management pages
 COOKIE_CONSENT_SELECTORS = [
     'button:has-text("Accept all cookies")',
+]
+
+# Common PDF link selectors (can be extended by subclasses)
+PDF_LINK_SELECTORS = [
+    "a[href*='/pdf/']",
+    "a[href*='.pdf']",
+    "a[href*='pdfft']",
+    'a:has-text("View PDF")',
+    'a:has-text("Download PDF")',
+    'a[data-track-action="download pdf"]',
+]
+
+# Links to skip when finding PDF links
+PDF_LINK_SKIP_PATTERNS = [
+    "purchase",
+    "getaccess",
+    "login",
+    "signin",
+    "subscribe",
 ]
 
 
@@ -199,18 +219,22 @@ class BaseSiteAdapter(ABC):
 
         elapsed = 0
         while elapsed < timeout:
-            # Check if paywall is gone and PDF is available
-            has_paywall = await watchdog.detect_paywall(page)
-            has_pdf = await watchdog.detect_pdf_available(page)
+            try:
+                # Check if paywall is gone and PDF is available
+                has_paywall = await watchdog.detect_paywall(page)
+                has_pdf = await watchdog.detect_pdf_available(page)
 
-            if not has_paywall and has_pdf:
-                print("\n检测到已获得访问权限，继续下载...")
-                return True
+                if not has_paywall and has_pdf:
+                    print("\n检测到已获得访问权限，继续下载...")
+                    return True
 
-            # Also check if we navigated to a PDF page directly
-            if ".pdf" in page.url.lower():
-                print("\n检测到 PDF 页面，继续下载...")
-                return True
+                # Also check if we navigated to a PDF page directly
+                if ".pdf" in page.url.lower():
+                    print("\n检测到 PDF 页面，继续下载...")
+                    return True
+            except Exception:
+                # Page is navigating during login, continue waiting
+                pass
 
             await asyncio.sleep(check_interval)
             elapsed += check_interval
@@ -221,6 +245,92 @@ class BaseSiteAdapter(ABC):
 
         print("\n等待超时，用户未完成认证")
         return False
+
+    async def find_pdf_link(
+        self,
+        extra_selectors: list[str] | None = None,
+    ) -> tuple[str | None, any]:
+        """
+        Find PDF download link on the current page.
+
+        Args:
+            extra_selectors: Additional selectors to try (site-specific)
+
+        Returns:
+            Tuple of (pdf_url, element) or (None, None) if not found
+        """
+        page = self.session.page
+        selectors = (extra_selectors or []) + PDF_LINK_SELECTORS
+
+        for selector in selectors:
+            try:
+                elem = await page.query_selector(selector)
+                if elem:
+                    href = await elem.get_attribute("href")
+                    if href:
+                        # Skip purchase/access links
+                        href_lower = href.lower()
+                        if any(skip in href_lower for skip in PDF_LINK_SKIP_PATTERNS):
+                            continue
+                        pdf_url = urljoin(self.base_url, href)
+                        logger.info(f"Found PDF link with selector: {selector}")
+                        return pdf_url, elem
+            except Exception:
+                continue
+
+        return None, None
+
+    async def download_pdf_via_js(self, pdf_url: str, save_path: str) -> DownloadResult:
+        """
+        Download PDF by triggering download via JavaScript.
+
+        This method creates a temporary link element and clicks it,
+        which works even when the original element is not visible.
+
+        Args:
+            pdf_url: URL of the PDF to download
+            save_path: Path to save the downloaded PDF
+
+        Returns:
+            DownloadResult with success status
+        """
+        from pathlib import Path
+
+        page = self.session.page
+        logger.info(f"Triggering download via JavaScript: {pdf_url}")
+        print(f"DEBUG: Triggering download via JavaScript: {pdf_url}")
+
+        try:
+            async with page.expect_download(timeout=60000) as download_info:
+                await page.evaluate(f'''() => {{
+                    const link = document.createElement('a');
+                    link.href = "{pdf_url}";
+                    link.download = "";
+                    link.style.display = "none";
+                    document.body.appendChild(link);
+                    link.click();
+                    document.body.removeChild(link);
+                }}''')
+
+            download = await download_info.value
+            await download.save_as(save_path)
+
+            file_size = Path(save_path).stat().st_size
+            print(f"PDF 下载成功! 文件大小: {file_size / 1024:.1f} KB")
+
+            return DownloadResult(
+                paper_id="",  # Will be set by caller
+                success=True,
+                pdf_path=save_path,
+                file_size=file_size,
+            )
+        except Exception as e:
+            logger.error(f"JavaScript download failed: {e}")
+            return DownloadResult(
+                paper_id="",
+                success=False,
+                error=str(e),
+            )
 
     def _extract_doi_from_url(self, url: str) -> str | None:
         """Extract DOI from URL if present."""

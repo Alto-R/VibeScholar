@@ -29,7 +29,7 @@ class Settings(BaseSettings):
 
     # Browser settings
     browser: Literal["chrome", "edge"] = Field(
-        default="chrome",
+        default="edge",
         description="Browser to use: 'chrome' (installed Chrome), 'edge' (installed Edge)",
     )
     headless: bool = Field(
