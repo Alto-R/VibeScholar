@@ -9,7 +9,6 @@ from urllib.parse import quote_plus, urljoin
 from playwright.async_api import TimeoutError as PlaywrightTimeout
 
 from ..browser.session import BrowserSession
-from ..browser.watchdogs import AuthWatchdog, CookieWatchdog
 from ..config import settings
 from ..papers.models import Author, DownloadResult, Paper, PaperSource, SearchQuery, SearchResult
 from .base import BaseSiteAdapter
@@ -30,25 +29,6 @@ class NatureAdapter(BaseSiteAdapter):
 
     def __init__(self, session: BrowserSession):
         super().__init__(session)
-        self.auth_watchdog = AuthWatchdog(session.session_id)
-        self.cookie_watchdog: CookieWatchdog | None = None
-
-    async def _start_cookie_monitor(self) -> None:
-        """Start background cookie consent monitor using CookieWatchdog."""
-        if self.cookie_watchdog is None:
-            self.cookie_watchdog = CookieWatchdog(self.session.page)
-        await self.cookie_watchdog.start()
-
-    async def _stop_cookie_monitor(self) -> None:
-        """Stop background cookie consent monitor."""
-        if self.cookie_watchdog:
-            await self.cookie_watchdog.stop()
-
-    async def _handle_cookie_consent(self) -> bool:
-        """Handle cookie consent popup once using CookieWatchdog."""
-        if self.cookie_watchdog is None:
-            self.cookie_watchdog = CookieWatchdog(self.session.page)
-        return await self.cookie_watchdog.handle_once()
 
     async def search(
         self,
@@ -189,59 +169,6 @@ class NatureAdapter(BaseSiteAdapter):
 
         except Exception as e:
             logger.warning(f"Error parsing search data: {e}")
-            return None
-
-    async def _parse_search_result(self, article) -> Paper | None:
-        """Parse a search result article element."""
-        try:
-            # Get title and URL
-            title_elem = await article.query_selector("h3 a, h2 a, .c-card__title a")
-            if not title_elem:
-                return None
-
-            title = await title_elem.inner_text()
-            href = await title_elem.get_attribute("href")
-            url = urljoin(self.base_url, href) if href else ""
-
-            # Get authors
-            authors = []
-            author_elems = await article.query_selector_all(".c-author-list__item, .c-card__author-list span")
-            for author_elem in author_elems:
-                name = await author_elem.inner_text()
-                name = name.strip().rstrip(",")
-                if name and name != "...":
-                    authors.append(Author(name=name))
-
-            # Get journal
-            journal_elem = await article.query_selector(".c-meta__item, .c-card__journal")
-            journal = await journal_elem.inner_text() if journal_elem else None
-
-            # Get date
-            date_elem = await article.query_selector("time, .c-meta__item time")
-            published_date = None
-            if date_elem:
-                date_str = await date_elem.get_attribute("datetime")
-                if date_str:
-                    try:
-                        published_date = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-                    except ValueError:
-                        pass
-
-            # Extract DOI from URL
-            doi = self._extract_doi_from_url(url)
-
-            return Paper(
-                title=title.strip(),
-                authors=authors,
-                url=url,
-                doi=doi,
-                journal=journal.strip() if journal else None,
-                published_date=published_date,
-                source=self.source,
-            )
-
-        except Exception as e:
-            logger.warning(f"Error parsing search result: {e}")
             return None
 
     async def get_paper_details(self, url: str) -> Paper:
@@ -505,18 +432,4 @@ class NatureAdapter(BaseSiteAdapter):
                 print(f"等待用户完成机构登录... ({elapsed}/{timeout}秒)")
 
         print("\n等待超时，用户未完成认证")
-        return False
-
-    async def check_access(self, url: str) -> bool:
-        """Check if we have access to the full text."""
-        await self._navigate(url)
-
-        # Check for paywall indicators
-        if await self.auth_watchdog.detect_paywall(self.session.page):
-            return False
-
-        # Check for PDF availability
-        if await self.auth_watchdog.detect_pdf_available(self.session.page):
-            return True
-
         return False

@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 from urllib.parse import urljoin
 
+from ..browser.watchdogs import AuthWatchdog, CookieWatchdog
 from ..papers.models import DownloadResult, Paper, PaperSource, SearchResult
 
 if TYPE_CHECKING:
@@ -60,6 +61,8 @@ class BaseSiteAdapter(ABC):
         """Initialize adapter with a browser session."""
         self.session = session
         self._last_request_time: float = 0
+        self.auth_watchdog = AuthWatchdog(session.session_id)
+        self.cookie_watchdog: CookieWatchdog | None = None
 
     @abstractmethod
     async def search(
@@ -112,7 +115,6 @@ class BaseSiteAdapter(ABC):
         """
         pass
 
-    @abstractmethod
     async def check_access(self, url: str) -> bool:
         """
         Check if we have access to the full text.
@@ -123,7 +125,17 @@ class BaseSiteAdapter(ABC):
         Returns:
             True if full text is accessible
         """
-        pass
+        await self._navigate(url)
+
+        # Check for paywall indicators
+        if await self.auth_watchdog.detect_paywall(self.session.page):
+            return False
+
+        # Check for PDF availability
+        if await self.auth_watchdog.detect_pdf_available(self.session.page):
+            return True
+
+        return False
 
     async def login(self, credentials: dict | None = None) -> bool:
         """
@@ -149,6 +161,23 @@ class BaseSiteAdapter(ABC):
         if elapsed < self.min_request_interval:
             await asyncio.sleep(self.min_request_interval - elapsed)
         self._last_request_time = time.time()
+
+    async def _start_cookie_monitor(self) -> None:
+        """Start background cookie consent monitor using CookieWatchdog."""
+        if self.cookie_watchdog is None:
+            self.cookie_watchdog = CookieWatchdog(self.session.page)
+        await self.cookie_watchdog.start()
+
+    async def _stop_cookie_monitor(self) -> None:
+        """Stop background cookie consent monitor."""
+        if self.cookie_watchdog:
+            await self.cookie_watchdog.stop()
+
+    async def _handle_cookie_consent(self) -> bool:
+        """Handle cookie consent popup once using CookieWatchdog."""
+        if self.cookie_watchdog is None:
+            self.cookie_watchdog = CookieWatchdog(self.session.page)
+        return await self.cookie_watchdog.handle_once()
 
     async def _navigate(self, url: str, wait_for_load: bool = True) -> None:
         """Navigate to URL with rate limiting and auto-accept cookies."""

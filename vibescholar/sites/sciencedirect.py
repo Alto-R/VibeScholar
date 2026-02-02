@@ -9,7 +9,7 @@ from urllib.parse import quote_plus, urljoin
 from playwright.async_api import TimeoutError as PlaywrightTimeout
 
 from ..browser.session import BrowserSession
-from ..browser.watchdogs import AuthWatchdog, CaptchaWatchdog, CookieWatchdog, PageState
+from ..browser.watchdogs import CaptchaWatchdog, PageState
 from ..papers.models import Author, DownloadResult, Paper, PaperSource, SearchQuery, SearchResult
 from .base import BaseSiteAdapter
 
@@ -71,8 +71,6 @@ class ScienceDirectAdapter(BaseSiteAdapter):
 
     def __init__(self, session: BrowserSession):
         super().__init__(session)
-        self.auth_watchdog = AuthWatchdog(session.session_id)
-        self.cookie_watchdog: CookieWatchdog | None = None
         self.captcha_watchdog: CaptchaWatchdog | None = None
 
     def _get_captcha_watchdog(self) -> CaptchaWatchdog:
@@ -87,23 +85,6 @@ class ScienceDirectAdapter(BaseSiteAdapter):
                 article_selectors=["h1.title-text", ".article-header", "#article"],
             )
         return self.captcha_watchdog
-
-    async def _start_cookie_monitor(self) -> None:
-        """Start background cookie consent monitor using CookieWatchdog."""
-        if self.cookie_watchdog is None:
-            self.cookie_watchdog = CookieWatchdog(self.session.page)
-        await self.cookie_watchdog.start()
-
-    async def _stop_cookie_monitor(self) -> None:
-        """Stop background cookie consent monitor."""
-        if self.cookie_watchdog:
-            await self.cookie_watchdog.stop()
-
-    async def _handle_cookie_consent(self) -> bool:
-        """Handle cookie consent popup once using CookieWatchdog."""
-        if self.cookie_watchdog is None:
-            self.cookie_watchdog = CookieWatchdog(self.session.page)
-        return await self.cookie_watchdog.handle_once()
 
     async def _wait_for_ready_state(self, timeout: int = 120000) -> PageState:
         """Wait for page to be in a ready state using CaptchaWatchdog."""
@@ -630,17 +611,3 @@ class ScienceDirectAdapter(BaseSiteAdapter):
             pass
 
         return None
-
-    async def check_access(self, url: str) -> bool:
-        """Check if we have access to the full text."""
-        await self._navigate(url)
-
-        # Check for paywall indicators
-        if await self.auth_watchdog.detect_paywall(self.session.page):
-            return False
-
-        # Check for PDF availability
-        if await self.auth_watchdog.detect_pdf_available(self.session.page):
-            return True
-
-        return False
