@@ -181,7 +181,10 @@ class BrowserSession:
 
     async def wait_for_load(self, timeout: int = 30000) -> None:
         """Wait for page to finish loading."""
-        await self.page.wait_for_load_state("networkidle", timeout=timeout)
+        try:
+            await self.page.wait_for_load_state("domcontentloaded", timeout=timeout)
+        except Exception:
+            pass  # Continue even if timeout
 
     async def screenshot(self, path: str | None = None, full_page: bool = False) -> bytes:
         """Take a screenshot."""
