@@ -108,8 +108,6 @@ class AuthWatchdog:
     async def detect_login_required(self, page: Page) -> bool:
         """Detect if the current page requires login."""
         url = page.url.lower()
-        content = await page.content()
-        content_lower = content.lower()
 
         # Check URL patterns
         for pattern in LOGIN_INDICATORS:
@@ -117,7 +115,13 @@ class AuthWatchdog:
                 logger.info(f"Login required detected in URL: {pattern}")
                 return True
 
-        # Check page content
+        # Check page content (use innerText to avoid HTML tags breaking text)
+        try:
+            content = await page.evaluate("document.body.innerText")
+        except Exception:
+            content = await page.content()
+        content_lower = content.lower()
+
         for pattern in LOGIN_INDICATORS:
             if re.search(pattern, content_lower, re.IGNORECASE):
                 logger.info(f"Login required detected in content: {pattern}")
@@ -127,7 +131,11 @@ class AuthWatchdog:
 
     async def detect_paywall(self, page: Page) -> bool:
         """Detect if the current page shows a paywall."""
-        content = await page.content()
+        # Use innerText instead of HTML content to avoid HTML tags breaking the text
+        try:
+            content = await page.evaluate("document.body.innerText")
+        except Exception:
+            content = await page.content()
         content_lower = content.lower()
 
         for pattern in PAYWALL_INDICATORS:
