@@ -478,8 +478,12 @@ class ScienceDirectAdapter(BaseSiteAdapter):
                 )
                 if institution_link:
                     await self.session.page.bring_to_front()
-                    await institution_link.click()
-                    await asyncio.sleep(1)
+                    try:
+                        await institution_link.click()
+                    except Exception as e:
+                        # Click may trigger navigation, causing element to detach
+                        logger.warning(f"Click triggered navigation (expected): {e}")
+                    await asyncio.sleep(2)
 
                 # Use base class method to wait for user authentication
                 if not await self.wait_for_user_auth(timeout=300):
@@ -488,6 +492,35 @@ class ScienceDirectAdapter(BaseSiteAdapter):
                         success=False,
                         error="Authentication timeout - user did not complete login",
                     )
+
+                # Save storage state after successful authentication
+                await self.session.save_storage_state()
+                print("已保存认证状态，下次下载无需重新登录")
+
+                # Check if institution doesn't have access after authentication
+                page_content = await self.session.page.evaluate("document.body.innerText")
+                page_content_lower = page_content.lower()
+                # ScienceDirect may show different messages for no access
+                no_access_indicators = [
+                    "is not available",
+                    "not subscribed",
+                    "no access",
+                    "purchase this article",
+                    "get access",
+                ]
+                if any(indicator in page_content_lower for indicator in no_access_indicators):
+                    # Double check - if we still see paywall after auth, institution has no access
+                    if await self.auth_watchdog.detect_paywall(self.session.page):
+                        logger.warning("Institution does not have access to this journal")
+                        print("\n" + "=" * 60)
+                        print("您的机构没有订阅此期刊的权限")
+                        print("请确认机构订阅范围")
+                        print("=" * 60 + "\n")
+                        return DownloadResult(
+                            paper_id=paper.id,
+                            success=False,
+                            error="Institution does not have access to this journal - please contact your library",
+                        )
 
             # Find PDF link using base class method
             logger.info("Looking for PDF download link...")

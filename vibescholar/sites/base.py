@@ -331,17 +331,33 @@ class BaseSiteAdapter(ABC):
 
         for selector in selectors:
             try:
-                elem = await page.query_selector(selector)
-                if elem:
+                # Use query_selector_all to find all matching elements
+                # Then select the first VISIBLE one
+                elements = await page.query_selector_all(selector)
+                for elem in elements:
                     href = await elem.get_attribute("href")
                     if href:
                         # Skip purchase/access links
                         href_lower = href.lower()
                         if any(skip in href_lower for skip in PDF_LINK_SKIP_PATTERNS):
                             continue
-                        pdf_url = urljoin(self.base_url, href)
-                        logger.info(f"Found PDF link with selector: {selector}")
-                        return pdf_url, elem
+
+                        # Check if element is visible before returning
+                        try:
+                            is_visible = await elem.is_visible()
+                            if is_visible:
+                                pdf_url = urljoin(self.base_url, href)
+                                logger.info(f"Found visible PDF link with selector: {selector}")
+                                return pdf_url, elem
+                            else:
+                                # Element exists but not visible, keep looking
+                                logger.debug(f"Found hidden PDF link with selector: {selector}, skipping")
+                        except Exception:
+                            # If visibility check fails, still return the element
+                            # (download_pdf will fall back to JS method if click fails)
+                            pdf_url = urljoin(self.base_url, href)
+                            logger.info(f"Found PDF link with selector: {selector} (visibility unknown)")
+                            return pdf_url, elem
             except Exception:
                 continue
 

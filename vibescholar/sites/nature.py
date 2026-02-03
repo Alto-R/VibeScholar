@@ -258,25 +258,15 @@ class NatureAdapter(BaseSiteAdapter):
         await self._start_cookie_monitor()
 
         try:
-            # Navigate to paper page if needed
-            if not paper.pdf_url:
-                await self._navigate(paper.url)
-                # Try to find PDF link
-                pdf_elem = await self.session.page.query_selector(
-                    "a[data-track-action='download pdf'], a[href*='/pdf/']"
-                )
-                if pdf_elem:
-                    pdf_href = await pdf_elem.get_attribute("href")
-                    paper.pdf_url = urljoin(self.base_url, pdf_href) if pdf_href else None
+            # Step 1: Navigate to paper page
+            await self._navigate(paper.url)
 
-            if not paper.pdf_url:
-                return DownloadResult(
-                    paper_id=paper.id,
-                    success=False,
-                    error="Could not find PDF download link",
-                )
+            # Step 2: Handle cookie consent popup first (may block other elements)
+            await self._handle_cookie_consent()
+            await asyncio.sleep(1)
 
-            # Check for paywall - Nature-specific handling
+            # Step 3: Check for paywall FIRST - before looking for PDF link
+            # This ensures users have a chance to authenticate before we give up
             if await self.auth_watchdog.detect_paywall(self.session.page):
                 logger.info("Paywall detected, initiating institutional access flow...")
 
@@ -289,33 +279,34 @@ class NatureAdapter(BaseSiteAdapter):
                         error="Authentication timeout - user did not complete login",
                     )
 
-                # Re-check for PDF URL after authentication
-                pdf_elem = await self.session.page.query_selector(
-                    'a[data-article-pdf="true"], a[data-track-action="download pdf"], a[href*="/pdf/"]'
-                )
-                if pdf_elem:
-                    pdf_href = await pdf_elem.get_attribute("href")
-                    paper.pdf_url = urljoin(self.base_url, pdf_href) if pdf_href else paper.pdf_url
+                # Re-navigate after authentication to get the authenticated page
+                await self._navigate(paper.url)
+                await self._handle_cookie_consent()
+                await asyncio.sleep(1)
 
-            # Download PDF - must click the download link, not navigate to PDF URL
-            # Navigating directly to PDF URL opens the browser's PDF viewer instead of triggering download
-            await self._navigate(paper.url)
+                # Check if institution doesn't have access (shows "Access to this article via X is not available")
+                page_content = await self.session.page.evaluate("document.body.innerText")
+                if "is not available" in page_content.lower() and "access to this article via" in page_content.lower():
+                    logger.warning("Institution does not have access to this journal")
+                    print("\n" + "=" * 60)
+                    print("您的机构没有订阅此期刊的权限")
+                    print("请确认机构订阅范围")
+                    print("=" * 60 + "\n")
+                    return DownloadResult(
+                        paper_id=paper.id,
+                        success=False,
+                        error="Institution does not have access to this journal - please contact your library",
+                    )
 
-            # Handle cookie consent popup first (may block download button)
-            await self._handle_cookie_consent()
-
-            # Wait for page to be fully loaded
-            await asyncio.sleep(1)
-
-            # Debug: print current URL
+            # Step 4: Now try to find PDF link (after potential authentication)
             logger.info(f"Current URL: {self.session.page.url}")
             print(f"DEBUG: Current URL: {self.session.page.url}")
 
-            # Find the download PDF link using base class method
             nature_selectors = [
                 'a[data-track-action="download pdf"]',
                 'a.c-pdf-download__link',
                 'a[href*="_reference.pdf"]',
+                'a[href*="/pdf/"]',
             ]
             pdf_url, pdf_download_link = await self.find_pdf_link(extra_selectors=nature_selectors)
 
@@ -334,7 +325,32 @@ class NatureAdapter(BaseSiteAdapter):
             logger.info(f"Full PDF URL: {pdf_url}")
             print(f"DEBUG: Full PDF URL: {pdf_url}")
 
-            # Download using base class method
+            # Step 5: Download PDF by clicking the actual button
+            # This is more reliable than JavaScript-created links for Nature
+            if pdf_download_link:
+                try:
+                    print("正在点击下载按钮...")
+                    async with self.session.page.expect_download(timeout=60000) as download_info:
+                        await pdf_download_link.click()
+
+                    download = await download_info.value
+                    await download.save_as(save_path)
+
+                    from pathlib import Path
+                    file_size = Path(save_path).stat().st_size
+                    print(f"PDF 下载成功! 文件大小: {file_size / 1024:.1f} KB")
+
+                    return DownloadResult(
+                        paper_id=paper.id,
+                        success=True,
+                        pdf_path=save_path,
+                        file_size=file_size,
+                    )
+                except Exception as e:
+                    logger.warning(f"Button click download failed: {e}, trying JavaScript method...")
+                    print(f"按钮点击下载失败，尝试 JavaScript 方法...")
+
+            # Fallback: Download using JavaScript method
             result = await self.download_pdf_via_js(pdf_url, save_path)
             result.paper_id = paper.id
             return result
@@ -380,8 +396,12 @@ class NatureAdapter(BaseSiteAdapter):
 
             # Bring browser to front before clicking
             await page.bring_to_front()
-            await institution_link.click()
-            await asyncio.sleep(1)  # Wait for navigation/popup
+            try:
+                await institution_link.click()
+            except Exception as e:
+                # Click may trigger navigation, causing element to detach - this is expected
+                logger.warning(f"Click triggered navigation (expected): {e}")
+            await asyncio.sleep(2)  # Wait for navigation to start
 
         # Step 2: Bring browser to foreground and wait for user to complete login
         await page.bring_to_front()
@@ -391,38 +411,48 @@ class NatureAdapter(BaseSiteAdapter):
         print("登录完成后，系统将自动检测并下载 PDF")
         print("=" * 60 + "\n")
 
-        # Step 3: Wait for PDF download button to appear
-        pdf_download_selector = (
-            'a[data-article-pdf="true"], '
-            'a.c-pdf-download__link[data-test="download-pdf"], '
-            'a[data-track-action="download pdf"]'
-        )
-
+        # Step 3: Wait for authentication to complete
+        # Check for: paywall gone AND PDF available, OR navigated to PDF page
         elapsed = 0
         check_interval = 2
 
         while elapsed < timeout:
-            # Check if PDF download button is available
-            pdf_button = await page.query_selector(pdf_download_selector)
+            try:
+                # Method 1: Check if paywall is gone and PDF is available
+                has_paywall = await self.auth_watchdog.detect_paywall(page)
+                has_pdf = await self.auth_watchdog.detect_pdf_available(page)
 
-            if pdf_button:
-                # Verify the button is visible and clickable
-                is_visible = await pdf_button.is_visible()
-                if is_visible:
-                    logger.info("PDF download button detected, clicking...")
-                    print("\n检测到 PDF 下载按钮，正在点击...")
+                if not has_paywall and has_pdf:
+                    logger.info("Authentication successful - paywall gone, PDF available")
+                    print("\n检测到已获得访问权限，继续下载...")
+                    # Save storage state after successful authentication
+                    await self.session.save_storage_state()
+                    print("已保存认证状态，下次下载无需重新登录")
+                    return True
 
-                    # Step 4: Click the download button
-                    pdf_href = await pdf_button.get_attribute("href")
-                    if pdf_href:
-                        # Update the page URL to the PDF URL for download
-                        logger.info(f"PDF URL found: {pdf_href}")
+                # Method 2: Check if we navigated to a PDF page directly
+                if ".pdf" in page.url.lower():
+                    print("\n检测到 PDF 页面，继续下载...")
+                    await self.session.save_storage_state()
+                    print("已保存认证状态，下次下载无需重新登录")
+                    return True
+
+                # Method 3: Check if we're back on the article page (not on WAYF/login page)
+                # and the page has a PDF download button
+                current_url = page.url.lower()
+                if "nature.com/articles" in current_url and not has_paywall:
+                    # We're on the article page without paywall - check for any PDF link
+                    pdf_link = await page.query_selector('a[href*="/pdf/"], a[href*=".pdf"]')
+                    if pdf_link:
+                        logger.info("Back on article page with PDF access")
+                        print("\n检测到已返回文章页面并获得访问权限...")
+                        await self.session.save_storage_state()
+                        print("已保存认证状态，下次下载无需重新登录")
                         return True
 
-            # Also check if we navigated to a PDF page directly
-            if ".pdf" in page.url.lower():
-                print("\n检测到 PDF 页面，继续下载...")
-                return True
+            except Exception:
+                # Page is navigating during login, continue waiting
+                pass
 
             await asyncio.sleep(check_interval)
             elapsed += check_interval

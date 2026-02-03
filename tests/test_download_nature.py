@@ -21,7 +21,7 @@ from vibescholar.config import settings
 
 # 搜索主题
 SEARCH_TOPIC = "large language model reasoning"
-MAX_PAPERS_PER_SOURCE = 3  # 每个来源下载3篇
+MAX_PAPERS_PER_SOURCE = 5  # 每个来源下载3篇
 
 
 async def test_nature(session):
